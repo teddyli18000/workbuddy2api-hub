@@ -1,0 +1,30 @@
+name: package-probe
+
+# Experiment only: figures out which distribution the runtime inside the released
+# portable package comes from, and builds a demo package from the repository
+# files with the development-only paths left out. Runs on push to this branch so
+# the result is a linkable CI run rather than a local claim.
+on:
+  push:
+    branches: [experiment/portable-package]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: probe runtime and build a demo package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Probe and build
+        run: >
+          python tools/package_probe.py
+          --official https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases/download/v1.6.2/wb-proxy-v1.6.2.zip
+          --out build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wb-proxy-demo-package
+          path: build/wb-proxy-demo.zip
+          if-no-files-found: warn
