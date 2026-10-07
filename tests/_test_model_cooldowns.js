@@ -6,28 +6,11 @@ const path = require('path');
 const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8');
 const script = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
   .map(match => match[1]).join('\n');
-const element = () => ({
-  innerHTML: '', textContent: '', value: '', style: {},
-  classList: {add(){}, remove(){}, contains(){ return false; }},
-  addEventListener(){}, querySelector(){ return null; }, querySelectorAll(){ return []; },
-  appendChild(){}, focus(){}, setAttribute(){}, getAttribute(){ return ''; },
+const dom = require('./_dom_stub.js');
+dom.installDom({
+  fetch: () => Promise.resolve({ok: true, status: 200, json: () => Promise.resolve({})}),
 });
-global.document = {
-  getElementById: element, querySelector: () => null, querySelectorAll: () => [],
-  addEventListener(){}, createElement: element, body: element(), head: element(),
-  documentElement: element(),
-};
-global.window = {addEventListener(){}, location: {href: ''},
-  matchMedia: () => ({matches: false, addEventListener(){}})};
-global.localStorage = {getItem(){ return null; }, setItem(){}, removeItem(){}};
-global.sessionStorage = global.localStorage;
-global.fetch = () => Promise.resolve({ok: true, status: 200, json: () => Promise.resolve({})});
-global.navigator = {userAgent: 'node'};
-global.setInterval = () => 0;
-global.setTimeout = () => 0;
-global.location = {href: '', search: '', hash: ''};
-global.alert = () => {};
-global.confirm = () => false;
+const element = dom.element;
 
 const {accountRow, coolPills, fmtCoolAt} = new Function(script + `
   return {accountRow, coolPills, fmtCoolAt};`)();

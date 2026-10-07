@@ -18,29 +18,11 @@ const script = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
 
 // renderAvailableModels() writes into #modelsTable tbody; capture it.
 const tbody = { innerHTML: '' };
-const element = () => ({
-  innerHTML: '', textContent: '', value: '', style: {},
-  classList: {add(){}, remove(){}, contains(){ return false; }},
-  addEventListener(){}, querySelector(){ return null; }, querySelectorAll(){ return []; },
-  appendChild(){}, focus(){}, setAttribute(){}, getAttribute(){ return ''; },
-});
-global.document = {
-  getElementById: element,
+// One shared fake DOM for every dashboard suite: tests/_dom_stub.js.
+const dom = require('./_dom_stub.js');
+dom.installDom({
   querySelector: sel => (sel === '#modelsTable tbody' ? tbody : null),
-  querySelectorAll: () => [],
-  addEventListener(){}, createElement: element, body: element(), head: element(),
-  documentElement: element(),
-};
-global.window = {addEventListener(){}, location: {href: '', search: ''},
-  matchMedia: () => ({matches: false, addEventListener(){}})};
-global.localStorage = {getItem(){ return null; }, setItem(){}, removeItem(){}};
-global.sessionStorage = global.localStorage;
-global.navigator = {userAgent: 'node'};
-global.setInterval = () => 0;
-global.setTimeout = () => 0;
-global.location = {href: '', search: '', hash: ''};
-global.alert = () => {};
-global.confirm = () => false;
+});
 global.fetch = () => {
   const payload = {current: 'intl', accounts: [], slots: [], data: [],
                    results: [], byAccount: []};

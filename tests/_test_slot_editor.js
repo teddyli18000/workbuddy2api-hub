@@ -16,35 +16,13 @@ const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8
 const script = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
   .map(match => match[1]).join('\n');
 
-// Element stubs are cached per id, so text the page writes can be read back.
-const elements = new Map();
-const element = (id) => {
-  let el = elements.get(id);
-  if(!el){
-    el = {id: id, innerHTML: '', textContent: '', value: '', checked: false, style: {},
-          classList: {add(){}, remove(){}, contains(){ return false; }},
-          addEventListener(){}, querySelector(){ return null; }, querySelectorAll(){ return []; },
-          appendChild(){}, focus(){}, setAttribute(){}, getAttribute(){ return ''; }};
-    elements.set(id, el);
-  }
-  return el;
-};
-global.document = {
-  getElementById: (id) => element(id),
-  querySelector: () => null, querySelectorAll: () => [],
-  addEventListener(){}, createElement: () => element('created'), body: element('body'),
-  head: element('head'), documentElement: element('html'),
-};
-global.window = {addEventListener(){}, location: {href: '', search: ''},
-  matchMedia: () => ({matches: false, addEventListener(){}})};
-global.localStorage = {getItem(){ return null; }, setItem(){}, removeItem(){}};
-global.sessionStorage = global.localStorage;
-global.navigator = {userAgent: 'node'};
-global.setInterval = () => 0;
-global.setTimeout = () => 0;
-global.location = {href: '', search: '', hash: ''};
-global.alert = () => {};
+// One shared fake DOM for every dashboard suite: tests/_dom_stub.js.
+const dom = require('./_dom_stub.js');
+dom.installDom();
+const element = id => dom.byId(id);
+// This suite deletes slots, so the confirmation prompt has to answer yes.
 global.confirm = () => true;
+global.window.confirm = global.confirm;
 
 // What the server would return for GET /proxy/slots; the test swaps it.
 let serverSlots = [];

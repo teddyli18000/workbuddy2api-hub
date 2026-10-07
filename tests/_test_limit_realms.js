@@ -16,36 +16,10 @@ const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8
 const script = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
   .map(match => match[1]).join('\n');
 
-const elements = new Map();
-function element(id){
-  if(!elements.has(id)){
-    elements.set(id, {
-      id: id, innerHTML: '', textContent: '', value: '', placeholder: '',
-      checked: false, disabled: false, style: {},
-      classList: {add(){}, remove(){}, contains(){ return false; }, toggle(){}},
-      addEventListener(){}, querySelector(){ return null; },
-      querySelectorAll(){ return []; }, appendChild(){}, focus(){},
-      setAttribute(){}, getAttribute(){ return ''; },
-    });
-  }
-  return elements.get(id);
-}
-
-global.document = {
-  getElementById: element, querySelector: () => null, querySelectorAll: () => [],
-  addEventListener(){}, createElement: () => element(''), body: element('body'),
-  head: element('head'), documentElement: element('html'),
-};
-global.window = {addEventListener(){}, location: {href: '', search: ''},
-  matchMedia: () => ({matches: false, addEventListener(){}})};
-global.localStorage = {getItem(){ return null; }, setItem(){}, removeItem(){}};
-global.sessionStorage = global.localStorage;
-global.navigator = {userAgent: 'node'};
-global.setInterval = () => 0;
-global.setTimeout = () => 0;
-global.location = {href: '', search: '', hash: ''};
-global.alert = () => {};
-global.confirm = () => false;
+// One shared fake DOM for every dashboard suite: tests/_dom_stub.js.
+const dom = require('./_dom_stub.js');
+dom.installDom();
+const element = id => dom.byId(id);
 
 let sent = null;
 global.fetch = (url, options) => {

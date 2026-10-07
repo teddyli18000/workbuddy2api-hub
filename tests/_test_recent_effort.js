@@ -14,36 +14,14 @@ const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8
 const script = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
   .map(match => match[1]).join('\n');
 
-// One persistent element per id, so the rendered table can be read back.
-const elements = new Map();
-const element = id => {
-  if (!elements.has(id)) {
-    elements.set(id, {
-      id, innerHTML: '', textContent: '', value: '', className: '', style: {},
-      classList: {add(){}, remove(){}, toggle(){}, contains(){ return false; }},
-      addEventListener(){}, querySelector(){ return null; }, querySelectorAll(){ return []; },
-      appendChild(){}, focus(){}, setAttribute(){}, getAttribute(){ return ''; },
-    });
-  }
-  return elements.get(id);
-};
-global.document = {
-  getElementById: element,
-  querySelector: () => null, querySelectorAll: () => [],
-  addEventListener(){}, createElement: () => element('created'),
-  body: element('body'), head: element('head'), documentElement: element('html'),
-};
-global.window = {addEventListener(){}, location: {href: '', search: ''},
-  matchMedia: () => ({matches: false, addEventListener(){}}), ACCOUNTS: []};
+// One shared fake DOM for every dashboard suite: tests/_dom_stub.js. It keeps
+// one persistent element per id, which is what lets the rendered table be read
+// back after refresh().
+const dom = require('./_dom_stub.js');
+dom.installDom();
+const element = id => dom.byId(id);
+global.window.ACCOUNTS = [];
 global.ACCOUNTS = global.window.ACCOUNTS;
-global.localStorage = {getItem(){ return null; }, setItem(){}, removeItem(){}};
-global.sessionStorage = global.localStorage;
-global.navigator = {userAgent: 'node'};
-global.setInterval = () => 0;
-global.setTimeout = () => 0;
-global.location = {href: '', search: '', hash: ''};
-global.alert = () => {};
-global.confirm = () => false;
 
 const ROWS = [
   {iso: '2026-10-06T12:00:00', model: 'deepseek-v4.1-flash', stream: true,

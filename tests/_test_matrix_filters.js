@@ -15,31 +15,12 @@ const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8
 const blocks = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
 const code = blocks.join('\n');
 
-const els = {};
-const mk = (id) => (els[id] = els[id] || {
-  id, innerHTML: '', textContent: '', value: '',
-  classList: { add(){}, remove(){}, contains(){ return false; } },
-  style: {}, children: [], focus(){}, blur(){}, click(){},
-  appendChild(c){ this.children.push(c); },
-  querySelectorAll(){ return []; }, querySelector(){ return null; },
-  addEventListener(){}, setAttribute(){}, getAttribute(){ return ''; },
-  insertAdjacentHTML(){}, removeChild(){}, remove(){},
+// One shared fake DOM for every dashboard suite: tests/_dom_stub.js.
+const dom = require('./_dom_stub.js');
+dom.installDom({
+  fetch: () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) }),
 });
-global.document = {
-  getElementById: (id) => (id ? mk(id) : null),
-  querySelectorAll: () => [], querySelector: () => null,
-  addEventListener: () => {}, createElement: (t) => mk(t + Math.random()),
-  body: mk('body'), head: mk('head'), documentElement: mk('html'),
-};
-global.window = { addEventListener(){}, location:{ href:'' }, matchMedia: () => ({ matches:false, addEventListener(){} }) };
-global.localStorage = { getItem(){return null;}, setItem(){}, removeItem(){} };
-global.sessionStorage = global.localStorage;
-global.fetch = () => Promise.resolve({ ok:true, status:200, json: () => Promise.resolve({}) });
-global.navigator = { userAgent: 'node' };
-global.setInterval = () => 0; global.clearInterval = () => {};
-global.setTimeout = () => 0; global.clearTimeout = () => {};
-global.location = { href: '', search: '', hash: '' };
-global.alert = () => {}; global.confirm = () => false;
+const mk = id => dom.byId(id);
 
 var api;
 try {
