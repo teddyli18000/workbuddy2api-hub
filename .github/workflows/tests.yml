@@ -9,10 +9,23 @@ on:
     branches: [main]
   pull_request:
 
+# A second push to the same branch makes the first run pointless: cancel it
+# instead of paying for two full matrices.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: ${{ matrix.os }} / python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
+    # run_all.py already bounds each suite; this is the backstop so a job that
+    # hangs outside a suite cannot hold a runner for the default six hours.
+    timeout-minutes: 20
+    env:
+      # Belt and braces next to run_all.py's own reconfigure: every Python
+      # process in the job reads and writes utf-8 whatever the runner locale is.
+      PYTHONUTF8: "1"
     strategy:
       # One failing version must not cancel the others: the point of the matrix
       # is to see which interpreter breaks.
@@ -36,4 +49,15 @@ jobs:
         with:
           node-version: "20"
       - name: Run every suite
-        run: python tests/run_all.py
+        # The suites are independent processes, so they run in parallel; each
+        # one's full output is kept on disk.
+        run: python tests/run_all.py --jobs 4 --logs suite-logs
+      - name: Keep what the failing suites printed
+        # The console shows one line per suite plus its first error; this keeps
+        # the whole output of every suite, which is what a red run needs.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-logs-${{ matrix.os }}-${{ matrix.python }}
+          path: suite-logs
+          if-no-files-found: ignore
