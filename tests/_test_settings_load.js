@@ -18,43 +18,10 @@ const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8
 const script = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
   .map(match => match[1]).join('\n');
 
-const elements = new Map();
-const bodyClasses = new Set();
-function element(id){
-  if(!elements.has(id)){
-    elements.set(id, {
-      id: id, innerHTML: '', textContent: '', value: '', placeholder: '',
-      checked: false, disabled: false, style: {}, dataset: {},
-      classList: {
-        add: name => bodyClasses.add(name),
-        remove: name => bodyClasses.delete(name),
-        contains: name => bodyClasses.has(name),
-        toggle(name, on){ if(on === false) bodyClasses.delete(name); else bodyClasses.add(name); },
-      },
-      addEventListener(){}, querySelector(){ return null; },
-      querySelectorAll(){ return []; }, appendChild(){}, focus(){},
-      setAttribute(){}, getAttribute(){ return ''; }, removeAttribute(){},
-      insertAdjacentHTML(){}, remove(){}, closest(){ return null; }, parentNode: null,
-    });
-  }
-  return elements.get(id);
-}
-
-global.document = {
-  getElementById: element, querySelector: () => null, querySelectorAll: () => [],
-  addEventListener(){}, createElement: () => element(''), body: element('body'),
-  head: element('head'), documentElement: element('html'),
-};
-global.window = {addEventListener(){}, location: {href: '', search: '', hash: ''},
-  matchMedia: () => ({matches: false, addEventListener(){}})};
-global.localStorage = {getItem(){ return null; }, setItem(){}, removeItem(){}};
-global.sessionStorage = global.localStorage;
-global.navigator = {userAgent: 'node'};
-global.setInterval = () => 0;
-global.setTimeout = () => 0;
-global.location = {href: '', search: '', hash: ''};
-global.alert = () => {};
-global.confirm = () => false;
+// One shared fake DOM for every dashboard suite: tests/_dom_stub.js.
+const dom = require('./_dom_stub.js');
+dom.installDom();
+const element = id => dom.byId(id);
 
 /* 三把 Key：两把跟随面板切换、一把固定国际版出口，其中一把带模型白名单。
    价估算总开关故意设成关，好顺带检查它有没有被写回复选框与 body 类。 */
@@ -146,7 +113,7 @@ global.__toasts = toasts;
   // 4. 价估算总开关：复选框要跟着后端值，关掉时 body 挂 pricing-off。
   assert.equal(element('setPricingEnabled').checked, false, '总开关复选框没写回');
   assert.equal(element('setPricingEnabledState').textContent, '(已关闭)');
-  assert.ok(bodyClasses.has('pricing-off'), '关闭时 body 应挂 pricing-off');
+  assert.ok(document.body.classList.contains('pricing-off'), '关闭时 body 应挂 pricing-off');
 
   // 5. 异常后面那些区块也得填上：漏填说明执行又提前断了。
   assert.equal(element('setVersion').textContent, 'v1.6.14');
