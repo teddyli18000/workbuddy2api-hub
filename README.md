@@ -174,6 +174,26 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 - 90 个套件：68 个 Python + 22 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12。推送 `v*` tag 时额外断言 **tag == 源码版本**（`wb_proxy.py` 里的两处版本串必须先一致，`-ci` 演练 tag 豁免）。
 
+### 7. 发布与打包（维护者）
+
+推一个 `v*` tag 就会由 `.github/workflows/release.yml` 走完整条发布链路：
+
+```text
+push vX.Y.Z tag
+  ↓  版本门禁：tag == wb_proxy.py 版本 == wrt Makefile 的 PKG_VERSION
+  ↓  等同一提交的测试矩阵（tests.yml）跑绿
+  ↓  便携 ZIP  +  OpenWrt .ipk / .apk
+  ↓  SHA256SUMS（按最终资产算，不是中间产物）
+  ↓  Draft Release（正文含固定的「下载说明」块）
+维护者在 Draft 里写版本说明 → 手动点 Publish
+```
+
+- **永不自动 publish**：工作流只创建/更新 draft，最后一步还会断言它仍然是 draft。重新跑同一个 tag 是幂等的：资产 `--clobber` 覆盖，正文里维护者写在 `<!-- release-download-block -->` 之上的说明原样保留。
+- **便携 ZIP** 按 `release/portable.txt` 的显式清单打包（不是全仓库 zip），包内另有一份 `release-manifest.json` 记录版本、受管文件与受保护目录（`accounts/`、`usage/`），供自更新（#29）消费。清单漏了哪个 `wb_*.py` 会被 `tests/_test_release_assets.py` 直接判红。
+- **OpenWrt 包**由 `wrt/` 的配方构建，两个脚本都要求源码版本与包 Makefile 一致才肯出包。
+- **演练**：给 tag 加 `-ci` 后缀（例如 `v1.6.17-ci`）会跳过 tag==版本 那一条断言、走完全相同的打包与 draft 流程，并且把 draft 额外标成 prerelease，避免演练产物被当成正式版；也可以用 `workflow_dispatch` 加 `dry_run=true` 只打包不碰任何 release。
+- Docker 镜像发布仍在原有路径上（`.github/workflows/docker-publish.yml`，Release published 后触发），本次未改动。
+
 ---
 
 ## 二、核心特性详解
@@ -424,6 +444,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 - **智能体一键配置 (Agent Config)**：参照 EasyCLIProxyAPI 的 agents 机制，支持对本机 Claude Code、Codex CLI、OpenCode、DSH、Crush 客户端的一键检测、配置写入与安全备份还原；内置纯标准库文本级 YAML/TOML/JSON 编辑器与两阶段事务回滚保护。
 - 新增 `tests/_test_agents.py`（26 项 / 97 断言）：覆盖 YAML/TOML/dotenv/JSON 编辑器、客户端注册表、两阶段原子回滚、备份还原与网关 handlers 端到端测试。
 - 新增 `tests/_test_agent_ui.js`（18 项断言）：把看板脚本载入 DOM 桩后直接调用真实的 `applyAgent()` / `restoreAgent()` / `loadAgents()`，断言实际发出的请求体与渲染结果，钉住请求字段名漂移与未声明标识符这两类只在浏览器里暴露的缺陷。
+- **tag 触发的发布打包与 Draft Release（issue #28）**：`v*` tag 现在由 `.github/workflows/release.yml` 一条链路走完——校验 tag / `wb_proxy.py` / `wrt` 包 Makefile 三处版本一致，等同一提交的测试矩阵跑绿，然后构建便携 ZIP、OpenWrt `.ipk` 与 `.apk`，按最终资产生成 `SHA256SUMS`，最后创建或更新 **Draft Release**。工作流永不 publish，最后一步还会断言它仍是 draft。便携 ZIP 按 `release/portable.txt` 的显式清单打包（不再依赖"全仓库 zip"这种偶然行为），包内附 `release-manifest.json` 记录版本、受管文件与受保护目录 `accounts/`、`usage/`，作为自更新（#29）的消费契约。OpenWrt 配方来自 #190 引用的 `aodianjun/workbuddy2api-hub/wrt/`，审计后并入：保留 `.ipk`/`.apk` 两个打包脚本、包 Makefile、init.d、uci 配置与面板缓存预热器；去掉 fork 专属的 GitHub 自更新器（`workbuddy2api-update` 及其 cron、`auto_update` 选项——OpenWrt 升级走包管理器）、fork 的工作流激活脚本与上游同步工作流，以及钉死上游 commit 的 `PIN_SHA`/`PIN_VER`（配方进了上游仓库后"从 GitHub 拉另一个 commit 的上游源码"没有意义，版本改为取自当前检出）。`-ci` 演练 tag 走完全相同的打包与 draft 流程，只是额外标成 prerelease。新增 `tests/_test_release_assets.py`（23 项）：清单覆盖每个 `wb_*.py`、清单路径都存在且不含受保护目录、ZIP 内容恰好等于清单 + 标记文件、重建逐字节相同、`SHA256SUMS` 覆盖每个资产且随字节变化、正文重写幂等且保留维护者写在标记之上的说明、工作流必须 `--draft` 且不含任何发布命令。
 
 两项与「大请求 + 号池规模」相关的可调限制，默认行为不变：
 

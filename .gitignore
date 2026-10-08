@@ -19,6 +19,14 @@ suite-logs/
 python/
 *.zip
 
+# 发布打包产物（release 工作流与 wrt/ 脚本的输出，只该出现在 Release 资产里）
+dist/
+.sdk-cache/
+wrt/ipk/
+wrt/apk/
+# build-apk.sh 把 wb_*.py 暂存进包目录再拷给 SDK，这是构建中间产物
+wrt/openwrt/workbuddy2api/files/usr/lib/
+
 # Python 编译缓存
 __pycache__/
 *.py[cod]

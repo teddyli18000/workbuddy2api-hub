@@ -1,0 +1,385 @@
+name: release
+
+# Tag-triggered release packaging (issue #28).
+#
+#   push vX.Y.Z  ->  version gate  ->  required tests  ->  ZIP + .ipk + .apk
+#                                                      ->  SHA256SUMS
+#                                                      ->  DRAFT release
+#
+# The release is only ever created/updated as a draft: the maintainer edits the
+# version notes above the generated "下载说明" block and clicks Publish. Nothing
+# in this workflow can publish it.
+#
+# A tag carrying the repository's existing `-ci` rehearsal suffix goes through
+# exactly the same path, but the draft is also marked prerelease, so a rehearsal
+# release can never be picked up by the updater planned in #29 (it ignores
+# prereleases).
+#
+# The test gate reuses the matrix tests.yml already runs for every v* tag
+# instead of paying for a second one: the job waits for that run to finish and
+# requires it to be green. A workflow_dispatch rehearsal has no tag-triggered
+# matrix to wait for, so it runs the suite in the job instead.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的 tag（演练可用 -ci 后缀，例如 v1.6.17-ci）"
+        required: true
+      dry_run:
+        description: "只打包与校验，不创建/更新任何 release"
+        # A string, not a boolean: the `inputs` context hands booleans back as
+        # strings on some paths, and `!inputs.dry_run` would then be false for
+        # both "true" and "false". Comparing against 'false' is unambiguous.
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+
+permissions:
+  contents: write
+
+# A release must not be built twice at once, and an in-flight run is worth
+# finishing (it is about to upload assets), so unlike tests.yml this one does
+# not cancel.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GH_REPO: ${{ github.repository }}
+  TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+  CHECKOUT_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+  # OpenWrt 25.x apk-tools package: needs the SDK because `apk mkpkg` ships in
+  # it. The tarball is cached, so only the first run pays for the download.
+  SDK_TARBALL: openwrt-sdk-25.12.2-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  SDK_REL: "25.12.2"
+
+jobs:
+  # ---- 1. tag == source version -------------------------------------------
+  # Same assertion tests.yml makes, repeated here because the release must not
+  # depend on another workflow's file staying shaped the way it is today.
+  version:
+    name: tag matches source version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+      rehearsal: ${{ steps.v.outputs.rehearsal }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+      - name: Assert tag == source version
+        id: v
+        run: |
+          set -euo pipefail
+          OVERVIEW=$(grep -oP '"version"\s*:\s*"\K[^"]+' wb_proxy.py | head -n1 || true)
+          SERVER=$(grep -oP 'server_version\s*=\s*"wb-proxy/\K[^"]+' wb_proxy.py | head -n1 || true)
+          echo "source: overview=$OVERVIEW server=$SERVER tag=$TAG"
+          if [ -z "$OVERVIEW" ] || [ "$OVERVIEW" != "$SERVER" ]; then
+            echo "::error::source version strings disagree ($OVERVIEW vs $SERVER)"
+            exit 1
+          fi
+          REHEARSAL=false
+          TAGVER="${TAG#v}"
+          if [[ "$TAG" == *-ci ]]; then
+            REHEARSAL=true
+            echo "rehearsal tag (-ci): skipping tag==version assertion (source=$OVERVIEW)"
+          elif [ "$TAGVER" != "$OVERVIEW" ]; then
+            echo "::error::tag $TAG != source version $OVERVIEW (bump the source first)"
+            exit 1
+          fi
+          # The OpenWrt recipe carries the same version in its package Makefile
+          # and is the third place that has to agree, so check it here instead
+          # of discovering the mismatch inside the SDK build.
+          PKGVER=$(sed -n 's/^PKG_VERSION:=//p' wrt/openwrt/workbuddy2api/Makefile | head -n1)
+          PKGREL=$(sed -n 's/^PKG_RELEASE:=//p' wrt/openwrt/workbuddy2api/Makefile | head -n1)
+          if [ "$PKGVER" != "$OVERVIEW" ]; then
+            echo "::error::wrt Makefile PKG_VERSION=$PKGVER != source version $OVERVIEW"
+            echo "        bump PKG_VERSION in wrt/openwrt/workbuddy2api/Makefile"
+            exit 1
+          fi
+          echo "version=$OVERVIEW" >> "$GITHUB_OUTPUT"
+          echo "release=$PKGREL" >> "$GITHUB_OUTPUT"
+          echo "rehearsal=$REHEARSAL" >> "$GITHUB_OUTPUT"
+          echo "version assert OK: $TAGVER (pkg release $PKGREL)"
+
+  # ---- 2. the required test matrix ----------------------------------------
+  gate:
+    name: required tests
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+      - uses: actions/setup-python@v5
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          node-version: "20"
+      - name: Wait for the tests workflow of this commit
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA="${{ github.sha }}"
+          WF=$(gh api "/repos/$GH_REPO/actions/workflows" \
+                 --jq '.workflows[] | select(.path == ".github/workflows/tests.yml") | .id')
+          [ -n "$WF" ] || { echo "::error::找不到 tests.yml 工作流"; exit 1; }
+          echo "tests workflow id: $WF, commit $SHA"
+
+          # The tag push starts both workflows at once, so the run may not be
+          # visible yet; wait for it before waiting on it.
+          RUN=""
+          for _ in $(seq 1 30); do
+            RUN=$(gh api "/repos/$GH_REPO/actions/workflows/$WF/runs?head_sha=$SHA&per_page=50" \
+                    --jq '[.workflow_runs[] | select(.event == "push")] | .[0].id // ""')
+            [ -n "$RUN" ] && break
+            sleep 10
+          done
+          [ -n "$RUN" ] || { echo "::error::提交 $SHA 上没有 tests 运行（tag 未触发测试？）"; exit 1; }
+          echo "waiting on run $RUN"
+
+          for _ in $(seq 1 150); do
+            read -r STATUS CONCLUSION <<<"$(gh api "/repos/$GH_REPO/actions/runs/$RUN" \
+                 --jq '"\(.status) \(.conclusion // "-")"')"
+            case "$STATUS $CONCLUSION" in
+              "completed success")
+                echo "required tests passed: $GITHUB_SERVER_URL/$GH_REPO/actions/runs/$RUN"
+                exit 0 ;;
+              "completed "*)
+                echo "::error::必需的测试没有通过（conclusion=$CONCLUSION）"
+                exit 1 ;;
+            esac
+            sleep 20
+          done
+          echo "::error::等待 tests 运行超时"
+          exit 1
+      - name: Run every suite (rehearsal dispatch has no tag-triggered matrix)
+        if: github.event_name == 'workflow_dispatch'
+        run: python tests/run_all.py --jobs 4
+
+  # ---- 3. portable ZIP ----------------------------------------------------
+  portable:
+    name: portable zip
+    needs: [version, gate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+      - name: Build the portable archive
+        run: |
+          set -euo pipefail
+          python release/release_tools.py portable \
+            --version "${{ needs.version.outputs.version }}" \
+            --tag "$TAG" \
+            --out "dist/workbuddy2api-hub-v${{ needs.version.outputs.version }}.zip"
+      - name: Keep the archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-zip
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ---- 4. OpenWrt .ipk + .apk ---------------------------------------------
+  openwrt:
+    name: openwrt packages
+    needs: [version, gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+      - name: Build .ipk (opkg path, no SDK needed)
+        run: sh wrt/openwrt/build-ipk.sh --app-src "$GITHUB_WORKSPACE"
+      - name: Cache the OpenWrt SDK tarball
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: .sdk-cache
+          key: ${{ env.SDK_TARBALL }}
+      - name: Download the SDK (cache miss only)
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          mkdir -p .sdk-cache
+          OUT=".sdk-cache/${SDK_TARBALL}"
+          # The official host is sometimes unusably slow on runners, so try
+          # mirrors and treat "slower than 200KB/s for 60s" as a stall.
+          ok=0
+          for base in \
+            "https://downloads.openwrt.org/releases/${SDK_REL}/targets/x86/64" \
+            "https://mirror2.openwrt.org/releases/${SDK_REL}/targets/x86/64" \
+            "https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/${SDK_REL}/targets/x86/64" \
+            "https://mirrors.ustc.edu.cn/openwrt/releases/${SDK_REL}/targets/x86/64"
+          do
+            echo "== mirror: ${base}"
+            if curl -fL --retry 2 --retry-all-errors --connect-timeout 20 \
+                 --max-time 1200 --speed-time 60 --speed-limit 204800 \
+                 -o "$OUT" "${base}/${SDK_TARBALL}"; then
+              ok=1; break
+            fi
+            echo "::warning::mirror failed or stalled, trying the next one"
+            rm -f "$OUT"
+          done
+          [ "$ok" = "1" ] || { echo "::error::no mirror served ${SDK_TARBALL}"; exit 1; }
+          ls -l "$OUT"
+      - name: Extract the SDK
+        run: |
+          set -eu
+          command -v zstd >/dev/null 2>&1 || { sudo apt-get update; sudo apt-get install -y zstd; }
+          mkdir -p "$RUNNER_TEMP/sdk"
+          tar --zstd -xf ".sdk-cache/${SDK_TARBALL}" -C "$RUNNER_TEMP/sdk"
+          SDK_DIR=$(find "$RUNNER_TEMP/sdk" -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n1)
+          [ -f "$SDK_DIR/rules.mk" ] || { echo "::error::unexpected SDK layout: $SDK_DIR"; exit 1; }
+          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "SDK ok: $SDK_DIR"
+      - name: Build .apk (apk-tools path, OpenWrt 25.x+)
+        run: sh wrt/openwrt/build-apk.sh "$SDK_DIR" "$GITHUB_WORKSPACE"
+      - name: Verify both packages against the tag
+        # The .ipk packer self-checks its own structure while it builds (GNU tar
+        # members, control fields, reproducible mtime). The .apk is checked here
+        # with the SDK's own apk, so a package cannot be uploaded under a version
+        # that only its file name claims.
+        run: |
+          set -euo pipefail
+          V="${{ needs.version.outputs.version }}"
+          R="${{ needs.version.outputs.release }}"
+          IPK="wrt/ipk/workbuddy2api_${V}-${R}_all.ipk"
+          APK="wrt/apk/workbuddy2api-${V}-r${R}.apk"
+          for f in "$IPK" "$APK"; do
+            [ -s "$f" ] || { echo "::error::资产为空或不存在：$f"; exit 1; }
+          done
+          APK_BIN="$SDK_DIR/staging_dir/host/bin/apk"
+          [ -x "$APK_BIN" ] || { echo "::error::SDK 里没有 apk 工具：$APK_BIN"; exit 1; }
+          "$APK_BIN" adbdump "$APK" | tee apk-dump.txt
+          grep -q "${V}-r${R}" apk-dump.txt \
+            || { echo "::error::.apk 元数据里的版本与 tag 不一致（期望 ${V}-r${R}）"; exit 1; }
+          grep -q 'python3-light' apk-dump.txt \
+            || { echo "::error::.apk 缺少 python3-light 依赖"; exit 1; }
+          ls -l "$IPK" "$APK"
+      - name: Stage both packages flat
+        # download-artifact rebuilds the tree relative to the upload root, so
+        # uploading wrt/ipk/*.ipk and wrt/apk/*.apk together lands them in
+        # dist/ipk/ and dist/apk/ and the draft job's dist/*.apk glob finds
+        # nothing. Everything is uploaded from one flat directory instead.
+        run: |
+          set -eu
+          mkdir -p dist
+          cp wrt/ipk/*.ipk wrt/apk/*.apk dist/
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-packages
+          path: dist/*
+          if-no-files-found: error
+
+  # ---- 5. checksums + Draft Release ---------------------------------------
+  draft:
+    name: draft release
+    needs: [version, portable, openwrt]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA256SUMS from the final assets
+        run: |
+          set -euo pipefail
+          ls -lR dist
+          assets=()
+          for pat in 'dist/*.zip' 'dist/*.ipk' 'dist/*.apk'; do
+            found=0
+            for f in $pat; do
+              [ -f "$f" ] || continue
+              assets+=("$f")
+              found=1
+            done
+            [ "$found" = "1" ] || { echo "::error::缺少资产：$pat"; exit 1; }
+          done
+          python release/release_tools.py checksums --out dist/SHA256SUMS "${assets[@]}"
+          echo "--- SHA256SUMS ---"
+          cat dist/SHA256SUMS
+      - name: Compose the release body (maintainer notes above the fixed block)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A re-run must keep whatever the maintainer already wrote above the
+          # marker, so read the current body back first. Both scratch files live
+          # under dist/ so the checkout stays clean.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release view "$TAG" --json body --jq .body > dist/existing-body.md
+          else
+            : > dist/existing-body.md
+          fi
+          python release/release_tools.py body \
+            --version "${{ needs.version.outputs.version }}" \
+            --release "${{ needs.version.outputs.release }}" \
+            --existing dist/existing-body.md --out dist/release-body.md
+          cat dist/release-body.md
+      - name: Show what a rehearsal would do
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run != 'false'
+        run: |
+          set -euo pipefail
+          echo "dry-run：不会创建或改动任何 release。真实执行时会运行："
+          echo "  gh release create|edit $TAG --draft --prerelease --notes-file dist/release-body.md"
+          echo "  gh release upload $TAG dist/*.zip dist/*.ipk dist/*.apk dist/SHA256SUMS --clobber"
+      - name: Create or update the Draft Release
+        if: github.event_name == 'push' || inputs.dry_run == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="WorkBuddy2API-Hub $TAG"
+          FLAGS=""
+          if [ "${{ needs.version.outputs.rehearsal }}" = "true" ]; then
+            # A rehearsal draft is marked prerelease as well, so even a mistaken
+            # publish cannot be picked up by #29's updater.
+            TITLE="$TITLE（演练）"
+            FLAGS="--prerelease"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "::error::$TAG 已经是一个已发布的 release，本工作流不碰它"
+              exit 1
+            fi
+            gh release edit "$TAG" --draft $FLAGS --title "$TITLE" --notes-file dist/release-body.md
+          else
+            gh release create "$TAG" --draft $FLAGS --title "$TITLE" --notes-file dist/release-body.md
+          fi
+          gh release upload "$TAG" dist/*.zip dist/*.ipk dist/*.apk dist/SHA256SUMS --clobber
+      - name: Prove the release is still a draft
+        if: github.event_name == 'push' || inputs.dry_run == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json isDraft,isPrerelease,assets \
+            --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease)", (.assets[].name)'
+          [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = "true" ] \
+            || { echo "::error::$TAG 不是 draft，立即停止"; exit 1; }
+          for want in workbuddy2api-hub-v${{ needs.version.outputs.version }}.zip \
+                      workbuddy2api_${{ needs.version.outputs.version }}-${{ needs.version.outputs.release }}_all.ipk \
+                      workbuddy2api-${{ needs.version.outputs.version }}-r${{ needs.version.outputs.release }}.apk \
+                      SHA256SUMS; do
+            gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qx "$want" \
+              || { echo "::error::draft 里缺少资产 $want"; exit 1; }
+          done
+          echo "draft ok：$GITHUB_SERVER_URL/$GH_REPO/releases — 等维护者写说明后手动 Publish"

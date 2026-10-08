@@ -1,0 +1,44 @@
+# 便携版 ZIP 的受管文件清单（issue #28，供 #29 的自更新消费）。
+#
+# 每行一个仓库相对路径，`#` 起头的行与空行忽略。**不要写通配符**：
+# 这份清单是"这个 release 拥有哪些文件"的权威答案，#29 只会替换/删除
+# 这里列出的文件，没列出来的用户文件一律不动。
+#
+# 刻意不包含：
+#   accounts/  usage/      —— 用户数据，属于受保护路径，永不作为替换目标
+#   Dockerfile / docker-compose* / quick-deploy.sh —— Docker 部署路径，不进便携包
+#   tests/  .github/  release/  wrt/ —— 开发与发布工具，不进便携包
+#   python/               —— 绿色包内置运行时，体积大且 .gitignore，由本地打包补进
+#
+# tests/_test_release_assets.py 会断言：仓库里每个 wb_*.py 都在这份清单里
+# （新增模块忘了登记会直接红），且清单里的路径都存在。
+
+LICENSE
+README.md
+dashboard.html
+
+start-wb-proxy.bat
+start-wb-proxy.command
+start-wb-proxy.sh
+start-wb-proxy-lan.bat
+start-wb-proxy-lan.command
+start-wb-proxy-lan.sh
+allow-firewall.bat
+allow-firewall.command
+
+wb_accounts.py
+wb_atrest.py
+wb_catalog.py
+wb_fingerprint.py
+wb_identity.py
+wb_ipintel.py
+wb_modelsdev.py
+wb_pricing.py
+wb_probes.py
+wb_prompt.py
+wb_proxy.py
+wb_scheduler.py
+wb_settings.py
+wb_tasks.py
+wb_webagent.py
+wb_webtools.py
