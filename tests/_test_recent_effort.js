@@ -1,10 +1,11 @@
 /* The recent-requests table shows the reasoning effort each request ran at.
 
    record_usage() writes reasoning_effort onto the usage row, /usage/recent hands
-   it to the panel, and the model cell renders it as a chip - the table keeps its
-   14 columns, because a 15th would not fit and the effort belongs to the model
-   that was picked. Rows without the field (older rows, models without reasoning
-   controls) must render exactly as before. Run with Node.
+   it to the panel, and the table renders it in its own column right after the
+   model - the effort is a property of the request, not of the model name, and a
+   separate column keeps it readable when the name is long. Rows without the
+   field (older rows, models without reasoning controls) show a dash instead of a
+   chip. Run with Node.
 */
 const assert = require('assert');
 const fs = require('fs');
@@ -81,18 +82,19 @@ const api = new Function(script + `
     assert.ok(cond, label + (extra ? '  [' + extra + ']' : ''));
   };
 
-  check('the table keeps its 14 columns',
-        (rendered.match(/<th>/g) || []).length === 14,
+  check('the table keeps its 15 columns',
+        (rendered.match(/<th>/g) || []).length === 15,
         String((rendered.match(/<th>/g) || []).length));
   check('the effort is rendered for the row that has it',
         rendered.includes('badge-effort') && rendered.includes('>high<'), rendered.slice(0, 300));
-  check('the chip sits in the model cell, after the name',
-        /data-label="模型">deepseek-v4\.1-flash <span class="badge-effort"/.test(rendered));
-  check('the model name is still shown as before',
-        rendered.includes('>deepseek-v4.1-flash<') === false &&
-        rendered.includes('deepseek-v4.1-flash'));
-  check('the row without an effort gets no chip',
-        /data-label="模型">hy3<\/td>/.test(rendered));
+  check('the effort has its own column, right after the model',
+        /data-label="模型">deepseek-v4\.1-flash<\/td><td data-label="推理强度"><span class="badge-effort">high<\/span><\/td>/.test(rendered),
+        rendered.slice(0, 300));
+  check('the model cell holds only the model name',
+        rendered.includes('data-label="模型">deepseek-v4.1-flash</td>'));
+  check('the row without an effort shows a dash, not a chip',
+        /data-label="模型">hy3<\/td><td data-label="推理强度"><span style="color:var\(--dim\)">—<\/span><\/td>/.test(rendered),
+        rendered.slice(0, 300));
   check('exactly one chip for two rows',
         (rendered.match(/badge-effort/g) || []).length === 1,
         String((rendered.match(/badge-effort/g) || []).length));
