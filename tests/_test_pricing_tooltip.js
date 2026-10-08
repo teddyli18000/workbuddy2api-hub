@@ -21,30 +21,14 @@ const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8
 const script = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
   .map(match => match[1]).join('\n');
 
-const element = (id) => ({
-  id: id, innerHTML: '', textContent: '', value: '', checked: false, style: {},
-  classList: {add(){}, remove(){}, toggle(){}, contains(){ return false; }},
-  addEventListener(){}, querySelector(){ return null; }, querySelectorAll(){ return []; },
-  appendChild(){}, focus(){}, setAttribute(){}, getAttribute(){ return ''; },
-  getBoundingClientRect(){ return {top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0}; },
-  offsetWidth: 0, offsetHeight: 0,
+// One shared fake DOM for every dashboard suite: tests/_dom_stub.js.
+const dom = require('./_dom_stub.js');
+const {window: domWindow} = dom.installDom({
+  fetch: () => Promise.resolve({status: 200, ok: true,
+    json: () => Promise.resolve({}), text: () => Promise.resolve('{}')}),
 });
-global.document = {
-  getElementById: (id) => element(id),
-  querySelector: () => null, querySelectorAll: () => [],
-  addEventListener(){}, createElement: () => element('created'),
-  body: element('body'), head: element('head'), documentElement: element('html'),
-};
-global.window = {addEventListener(){}, location: {href: '', search: ''},
-  innerWidth: 1600, innerHeight: 900,
-  matchMedia: () => ({matches: false, addEventListener(){}})};
-global.localStorage = {getItem(){ return null; }, setItem(){}, removeItem(){}};
-global.sessionStorage = global.localStorage;
-global.navigator = {userAgent: 'node'};
-global.setInterval = () => 0;
-global.setTimeout = () => 0;
-global.fetch = () => Promise.resolve({status: 200, ok: true,
-  json: () => Promise.resolve({}), text: () => Promise.resolve('{}')});
+// The tooltip measures itself against the viewport before placing itself.
+domWindow.innerWidth = 1600;
 
 const api = new Function(script + `
   return {costTitle, costTipHtml, costTipModel, costVariantSuffix, fmtRate};`)();

@@ -16,47 +16,21 @@ const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8
 const script = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
   .map(match => match[1]).join('\n');
 
-const elements = new Map();
-function element(id){
-  if(!elements.has(id)){
-    elements.set(id, {
-      id: id, innerHTML: '', textContent: '', value: '', placeholder: '',
-      checked: false, disabled: false, style: {},
-      classList: {add(){}, remove(){}, contains(){ return false; }, toggle(){}},
-      addEventListener(){}, querySelector(){ return null; },
-      querySelectorAll(){ return []; }, appendChild(){}, focus(){},
-      setAttribute(){}, getAttribute(){ return ''; },
-    });
-  }
-  return elements.get(id);
-}
-
-global.document = {
-  getElementById: element, querySelector: () => null, querySelectorAll: () => [],
-  addEventListener(){}, createElement: () => element(''), body: element('body'),
-  head: element('head'), documentElement: element('html'),
-};
-global.window = {addEventListener(){}, location: {href: '', search: ''},
-  matchMedia: () => ({matches: false, addEventListener(){}})};
-global.localStorage = {getItem(){ return null; }, setItem(){}, removeItem(){}};
-global.sessionStorage = global.localStorage;
-global.navigator = {userAgent: 'node'};
-global.setInterval = () => 0;
-global.setTimeout = () => 0;
-global.location = {href: '', search: '', hash: ''};
-global.alert = () => {};
-global.confirm = () => false;
+// One shared fake DOM for every dashboard suite: tests/_dom_stub.js.
+const dom = require('./_dom_stub.js');
 
 let sent = null;
-global.fetch = (url, options) => {
-  const body = options && options.body ? JSON.parse(options.body) : null;
-  if(url === '/settings/save' && body) sent = body;
-  const payload = {current: 'intl', accounts: [], slots: [], data: [],
-                   results: [], byAccount: []};
-  return Promise.resolve({status: 200, ok: true,
-    json: () => Promise.resolve(payload),
-    text: () => Promise.resolve(JSON.stringify(payload))});
-};
+dom.installDom({
+  fetch: (url, options) => {
+    const body = options && options.body ? JSON.parse(options.body) : null;
+    if(url === '/settings/save' && body) sent = body;
+    const payload = {current: 'intl', accounts: [], slots: [], data: [],
+                     results: [], byAccount: []};
+    return Promise.resolve({status: 200, ok: true,
+      json: () => Promise.resolve(payload),
+      text: () => Promise.resolve(JSON.stringify(payload))});
+  },
+});
 
 const realLog = console.log;
 console.log = () => {};
@@ -106,20 +80,20 @@ const api = new Function(script + `
   assert.equal(api.limitEl('Cn', 'Reserve').value, '');
   assert.equal(api.limitEl('Cn', 'Reserve').placeholder, '继承 10');
   assert.equal(api.limitEl('Intl', 'DailyToken').placeholder, '继承 1,000');
-  assert.equal(element('setLimitsPerRealm').checked, true, '有覆盖时勾上分版本');
-  assert.equal(element('setReserveState').textContent, '(全局 10 · 国际版 3)');
-  assert.equal(element('setDailyTokenState').textContent, '(全局 1,000)');
+  assert.equal(dom.byId('setLimitsPerRealm').checked, true, '有覆盖时勾上分版本');
+  assert.equal(dom.byId('setReserveState').textContent, '(全局 10 · 国际版 3)');
+  assert.equal(dom.byId('setDailyTokenState').textContent, '(全局 1,000)');
 
   // 3. 没有覆盖时：分版本收起，两个版本列都留空。
   api.applyLimits({limits: {
     reserve_credits: {global: 0, intl: null, cn: null},
   }});
-  assert.equal(element('setLimitsPerRealm').checked, false);
-  assert.equal(element('setLimitsState').textContent, '(全局生效)');
-  assert.equal(element('setReserveState').textContent, '(全部关闭)');
+  assert.equal(dom.byId('setLimitsPerRealm').checked, false);
+  assert.equal(dom.byId('setLimitsState').textContent, '(全局生效)');
+  assert.equal(dom.byId('setReserveState').textContent, '(全部关闭)');
 
   // 4. 收起分版本时保存：即使版本列里还留着旧数字，也按“继承”发出去。
-  element('setLimitsPerRealm').checked = false;
+  dom.byId('setLimitsPerRealm').checked = false;
   api.limitEl('Global', 'Reserve').value = '20';
   api.limitEl('Intl', 'Reserve').value = '5';
   api.limitEl('Cn', 'Reserve').value = '1';
@@ -135,7 +109,7 @@ const api = new Function(script + `
   ]);
 
   // 5. 勾上分版本时保存：填了值的版本发数字，留空的仍发 null。
-  element('setLimitsPerRealm').checked = true;
+  dom.byId('setLimitsPerRealm').checked = true;
   api.limitEl('Global', 'Reserve').value = '20';
   api.limitEl('Intl', 'Reserve').value = '5';
   api.limitEl('Cn', 'Reserve').value = '';
@@ -146,13 +120,13 @@ const api = new Function(script + `
 
   // 6. 非法输入直接拦下，不发请求。
   sent = null;
-  element('setLimitsPerRealm').checked = false;
+  dom.byId('setLimitsPerRealm').checked = false;
   api.limitEl('Global', 'DailyToken').value = 'abc';
   await api.saveLimits(null);
   assert.equal(sent, null, '非法的全局默认不应发请求');
 
   sent = null;
-  element('setLimitsPerRealm').checked = true;
+  dom.byId('setLimitsPerRealm').checked = true;
   api.limitEl('Global', 'DailyToken').value = '10';
   api.limitEl('Cn', 'DailyToken').value = '-1';
   await api.saveLimits(null);

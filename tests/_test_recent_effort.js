@@ -14,36 +14,24 @@ const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8
 const script = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
   .map(match => match[1]).join('\n');
 
-// One persistent element per id, so the rendered table can be read back.
-const elements = new Map();
-const element = id => {
-  if (!elements.has(id)) {
-    elements.set(id, {
-      id, innerHTML: '', textContent: '', value: '', className: '', style: {},
-      classList: {add(){}, remove(){}, toggle(){}, contains(){ return false; }},
-      addEventListener(){}, querySelector(){ return null; }, querySelectorAll(){ return []; },
-      appendChild(){}, focus(){}, setAttribute(){}, getAttribute(){ return ''; },
+// One shared fake DOM for every dashboard suite: tests/_dom_stub.js. Elements
+// are persistent per id, so the rendered table can be read back.
+const dom = require('./_dom_stub.js');
+const {window: domWindow} = dom.installDom({
+  fetch: url => {
+    const payload = String(url).includes('/usage/recent')
+      ? {rows: ROWS, total: 2, page: 1, total_pages: 1, accounts_map: {}}
+      : {rows: [], total: 0, accounts_map: {}, accounts: [], slots: [], data: [],
+         results: [], byAccount: []};
+    return Promise.resolve({
+      status: 200, ok: true,
+      json: () => Promise.resolve(payload),
+      text: () => Promise.resolve(JSON.stringify(payload)),
     });
-  }
-  return elements.get(id);
-};
-global.document = {
-  getElementById: element,
-  querySelector: () => null, querySelectorAll: () => [],
-  addEventListener(){}, createElement: () => element('created'),
-  body: element('body'), head: element('head'), documentElement: element('html'),
-};
-global.window = {addEventListener(){}, location: {href: '', search: ''},
-  matchMedia: () => ({matches: false, addEventListener(){}}), ACCOUNTS: []};
-global.ACCOUNTS = global.window.ACCOUNTS;
-global.localStorage = {getItem(){ return null; }, setItem(){}, removeItem(){}};
-global.sessionStorage = global.localStorage;
-global.navigator = {userAgent: 'node'};
-global.setInterval = () => 0;
-global.setTimeout = () => 0;
-global.location = {href: '', search: '', hash: ''};
-global.alert = () => {};
-global.confirm = () => false;
+  },
+});
+domWindow.ACCOUNTS = [];
+global.ACCOUNTS = domWindow.ACCOUNTS;
 
 const ROWS = [
   {iso: '2026-10-06T12:00:00', model: 'deepseek-v4.1-flash', stream: true,
@@ -54,17 +42,6 @@ const ROWS = [
    elapsed_ms: 900, ttft_ms: null, prompt_tokens: 4, completion_tokens: 2,
    total_tokens: 6, credit: 0, account: 'uid-1'},
 ];
-global.fetch = url => {
-  const payload = String(url).includes('/usage/recent')
-    ? {rows: ROWS, total: 2, page: 1, total_pages: 1, accounts_map: {}}
-    : {rows: [], total: 0, accounts_map: {}, accounts: [], slots: [], data: [],
-       results: [], byAccount: []};
-  return Promise.resolve({
-    status: 200, ok: true,
-    json: () => Promise.resolve(payload),
-    text: () => Promise.resolve(JSON.stringify(payload)),
-  });
-};
 
 const api = new Function(script + `
   window.updateUI = updateUI;
@@ -74,25 +51,26 @@ const api = new Function(script + `
 (async () => {
   window.VIEW_REALM = 'intl';
   await api.refresh();
-  const rendered = element('recent').innerHTML;
+  const rendered = dom.byId('recent').innerHTML;
   let checks = 0;
   const check = (label, cond, extra) => {
     checks += 1;
     assert.ok(cond, label + (extra ? '  [' + extra + ']' : ''));
   };
 
-  check('the table keeps its 14 columns',
-        (rendered.match(/<th>/g) || []).length === 14,
+  check('the table keeps its 15 columns',
+        (rendered.match(/<th>/g) || []).length === 15,
         String((rendered.match(/<th>/g) || []).length));
   check('the effort is rendered for the row that has it',
         rendered.includes('badge-effort') && rendered.includes('>high<'), rendered.slice(0, 300));
-  check('the chip sits in the model cell, after the name',
-        /data-label="模型">deepseek-v4\.1-flash <span class="badge-effort"/.test(rendered));
-  check('the model name is still shown as before',
-        rendered.includes('>deepseek-v4.1-flash<') === false &&
-        rendered.includes('deepseek-v4.1-flash'));
-  check('the row without an effort gets no chip',
-        /data-label="模型">hy3<\/td>/.test(rendered));
+  check('the effort has its own column, right after the model',
+        /data-label="模型">deepseek-v4\.1-flash<\/td><td data-label="推理强度"><span class="badge-effort">high<\/span><\/td>/.test(rendered),
+        rendered.slice(0, 300));
+  check('the model cell holds only the model name',
+        rendered.includes('data-label="模型">deepseek-v4.1-flash</td>'));
+  check('the row without an effort shows a dash, not a chip',
+        /data-label="模型">hy3<\/td><td data-label="推理强度"><span style="color:var\(--dim\)">—<\/span><\/td>/.test(rendered),
+        rendered.slice(0, 300));
   check('exactly one chip for two rows',
         (rendered.match(/badge-effort/g) || []).length === 1,
         String((rendered.match(/badge-effort/g) || []).length));
