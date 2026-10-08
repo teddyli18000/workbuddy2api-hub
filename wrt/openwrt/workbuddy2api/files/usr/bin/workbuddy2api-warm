@@ -1,0 +1,123 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""workbuddy2api 面板缓存预热器（OpenWrt 版）
+
+面板的统计接口每次缓存过期都要全量重扫 usage.jsonl（2 万行在这台路由器上
+约 12 秒，而且日志在增长）。用户切「今日/本周/本月/全部」时如果正好撞上
+过期，就要干等十几秒——本脚本由 cron 定期把这些贵接口先跑一遍，让缓存
+始终保持热乎，用户点开即是毫秒级。
+
+覆盖：主页面用的 /usage 汇总 + 统计页的 4 个时间窗。
+开关：uci workbuddy2api.main.warm（默认 1，设 0 跳过）。
+日志：写 syslog，`logread -e workbuddy2api-warm` 可看。
+"""
+
+import json
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+QUIET = "--quiet" in sys.argv
+
+
+def log(msg):
+    if not QUIET:
+        sys.stdout.write("[warm] %s\n" % msg)
+        sys.stdout.flush()
+    try:
+        subprocess.run(["logger", "-t", "workbuddy2api-warm", msg], timeout=10)
+    except Exception:
+        pass
+
+
+def uci_get(option, default=None):
+    try:
+        out = subprocess.run(["uci", "get", "workbuddy2api.main.%s" % option],
+                             capture_output=True, text=True, timeout=10)
+        value = out.stdout.strip()
+        return value if out.returncode == 0 and value else default
+    except Exception:
+        return default
+
+
+def request(url, data=None, headers=None, timeout=180):
+    req = urllib.request.Request(url, data=data, headers=headers or {})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+            return resp.status, time.time() - t0
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.read()
+        except Exception:
+            pass
+        return exc.code, time.time() - t0
+    except Exception as exc:
+        return None, time.time() - t0
+
+
+def main():
+    if uci_get("warm", "1") == "0":
+        log("预热已在 uci 里关闭（workbuddy2api.main.warm=0），跳过")
+        return 0
+
+    port = uci_get("port", "8788")
+    password = uci_get("panel_password", "")
+    base = "http://127.0.0.1:%s" % port
+
+    # 面板密码留空时面板用的是默认密码，预热就跳过（避免无谓的失败登录）
+    if not password:
+        log("uci 里没有 panel_password，跳过预热")
+        return 0
+
+    body = json.dumps({"password": password}).encode("utf-8")
+    req = urllib.request.Request(base + "/panel/login", data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            token = json.load(resp).get("token", "")
+    except urllib.error.HTTPError as exc:
+        log("登录失败（http=%s），跳过本轮" % exc.code)
+        return 1
+    except Exception as exc:
+        log("登录出错：%r，跳过本轮" % exc)
+        return 1
+    if not token:
+        log("登录响应里没有 token，跳过")
+        return 1
+
+    headers = {"X-Panel-Token": token}
+    targets = [
+        "/usage?realm=all",
+        "/usage/analytics?realm=all&range=today",
+        "/usage/analytics?realm=all&range=week",
+        "/usage/analytics?realm=all&range=month",
+        "/usage/analytics?realm=all&range=all",
+    ]
+
+    slow = []
+    worst = 0.0
+    worst_path = ""
+    for path in targets:
+        code, dt = request(base + path, headers=headers, timeout=300)
+        if code != 200:
+            log("预热 %s 失败 http=%s (%.1fs)" % (path, code, dt))
+            slow.append(path)
+        elif dt > worst:
+            worst, worst_path = dt, path
+    # 每轮只记一行（syslog 是环形缓冲，别把别的服务的日志刷掉）；
+    # 有失败或单接口超过 20 秒（说明重建已经明显变慢）才多记一行。
+    log("本轮预热完成（%d 个接口，最慢 %.1fs）" % (len(targets), worst))
+    if worst >= 20.0:
+        log("注意：%s 重建耗时 %.1fs，日志变大后该值会继续上升" % (worst_path, worst))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(1)
