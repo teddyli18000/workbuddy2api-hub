@@ -4,11 +4,18 @@
 # 这份清单是"这个 release 拥有哪些文件"的权威答案，#29 只会替换/删除
 # 这里列出的文件，没列出来的用户文件一律不动。
 #
+# 除这些文件之外，打包器还会放进两样东西（都不是本清单的行）：
+#   python/                精简 CPython 运行时，见 release/portable_runtime.py；
+#                          release_tools.py portable --runtime 强制要求它存在，
+#                          缺了它就不是便携包而是源码包了
+#   release-manifest.json  包内标记文件，写死版本、root、受管文件与受保护目录
+# 整包放在 root 目录（默认 wb-proxy/）下，与既有便携包一致。
+#
 # 刻意不包含：
 #   accounts/  usage/      —— 用户数据，属于受保护路径，永不作为替换目标
+#                            （程序启动时自己 os.makedirs，不需要占位文件）
 #   Dockerfile / docker-compose* / quick-deploy.sh —— Docker 部署路径，不进便携包
-#   tests/  .github/  release/  wrt/ —— 开发与发布工具，不进便携包
-#   python/               —— 绿色包内置运行时，体积大且 .gitignore，由本地打包补进
+#   tests/  .github/  release/  wrt/  scripts/ —— 开发与发布工具，不进便携包
 #
 # tests/_test_release_assets.py 会断言：仓库里每个 wb_*.py 都在这份清单里
 # （新增模块忘了登记会直接红），且清单里的路径都存在。
@@ -25,6 +32,10 @@ start-wb-proxy-lan.command
 start-wb-proxy-lan.sh
 allow-firewall.bat
 allow-firewall.command
+
+# 随包价格快照：wb_pricing._candidate_file() 优先读它（存在即覆盖内置那份），
+# 少了它便携包只能退回 wb_pricing.py 里内嵌的旧价
+pricing/pricing.json
 
 wb_accounts.py
 wb_atrest.py

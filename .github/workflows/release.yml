@@ -2,23 +2,31 @@ name: release
 
 # Tag-triggered release packaging (issue #28).
 #
-#   push vX.Y.Z  ->  version gate  ->  required tests  ->  ZIP + .ipk + .apk
-#                                                      ->  SHA256SUMS
-#                                                      ->  DRAFT release
+#   push vX.Y.Z  ->  version gate  ->  full test matrix  ->  ZIP + .ipk + .apk
+#                                                         ->  SHA256SUMS
+#                                                         ->  DRAFT release
 #
 # The release is only ever created/updated as a draft: the maintainer edits the
 # version notes above the generated "下载说明" block and clicks Publish. Nothing
 # in this workflow can publish it.
 #
+# Two things this workflow refuses to guess:
+#
+#   * The portable asset is the *green* package, so it carries the trimmed
+#     CPython runtime the launchers look for (python\python.exe). CI cannot
+#     rebuild that runtime from the repository, so it is a pinned, checksummed
+#     release input (release/portable_runtime.py) and the package is built and
+#     booted on Windows - a Linux-built ZIP could only ever be a source archive.
+#
+#   * Every path that writes a release requires the *whole* existing matrix
+#     (the legs are read from tests.yml, so adding one widens the gate) to have
+#     passed for the target commit. A reduced single-OS run is only allowed for
+#     a packaging-only dry run, and that path never touches a release.
+#
 # A tag carrying the repository's existing `-ci` rehearsal suffix goes through
 # exactly the same path, but the draft is also marked prerelease, so a rehearsal
 # release can never be picked up by the updater planned in #29 (it ignores
 # prereleases).
-#
-# The test gate reuses the matrix tests.yml already runs for every v* tag
-# instead of paying for a second one: the job waits for that run to finish and
-# requires it to be green. A workflow_dispatch rehearsal has no tag-triggered
-# matrix to wait for, so it runs the suite in the job instead.
 on:
   push:
     tags: ["v*"]
@@ -52,6 +60,11 @@ env:
   GH_REPO: ${{ github.repository }}
   TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
   CHECKOUT_REF: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+  # Belt and braces next to the scripts' own reconfigure: every Python process
+  # in the job reads and writes utf-8 whatever the runner locale is. The
+  # Windows runner's console is cp1252, which is what killed the first
+  # rehearsal at the first Chinese summary line.
+  PYTHONUTF8: "1"
   # OpenWrt 25.x apk-tools package: needs the SDK because `apk mkpkg` ships in
   # it. The tarball is cached, so only the first run pays for the download.
   SDK_TARBALL: openwrt-sdk-25.12.2-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
@@ -107,84 +120,222 @@ jobs:
           echo "rehearsal=$REHEARSAL" >> "$GITHUB_OUTPUT"
           echo "version assert OK: $TAGVER (pkg release $PKGREL)"
 
-  # ---- 2. the required test matrix ----------------------------------------
+  # ---- 2. the gate every release-writing path must pass --------------------
   gate:
     name: required tests
     needs: version
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    outputs:
+      # Set by the step that actually checks every leg, not by `decide`: an
+      # output wired to the wrong step is empty, and the draft job then refuses
+      # the write - which is how this was caught the first time it ran.
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
-        if: github.event_name == 'workflow_dispatch'
         with:
           ref: ${{ env.CHECKOUT_REF }}
       - uses: actions/setup-python@v5
-        if: github.event_name == 'workflow_dispatch'
         with:
           python-version: "3.12"
       - uses: actions/setup-node@v4
-        if: github.event_name == 'workflow_dispatch'
         with:
           node-version: "20"
-      - name: Wait for the tests workflow of this commit
-        if: github.event_name == 'push'
+      - name: Decide what this run is allowed to do
+        id: decide
+        run: |
+          set -euo pipefail
+          WRITES=false
+          if [ "${{ github.event_name }}" = "push" ]; then
+            WRITES=true
+          elif [ "${{ inputs.dry_run }}" = "false" ]; then
+            WRITES=true
+          fi
+          echo "writes=$WRITES" >> "$GITHUB_OUTPUT"
+          if [ "$WRITES" = "true" ]; then
+            echo "本 run 会写 Draft Release：必须先在目标提交上拿到完整矩阵"
+          else
+            echo "packaging-only 演练（dry_run=true）：不碰任何 release，单 OS 跑一遍套件即可"
+          fi
+      - name: Require the full matrix for this commit
+        # Only a full matrix may authorise a release mutation. The legs come
+        # from tests.yml, so a leg dropped there cannot silently weaken this.
+        id: matrix
+        if: steps.decide.outputs.writes == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           SHA="${{ github.sha }}"
+          mapfile -t EXPECTED < <(python release/matrix_legs.py)
+          if [ "${#EXPECTED[@]}" -eq 0 ]; then
+            echo "::error::解析不出 tests.yml 的测试矩阵，拒绝授权发布"
+            exit 1
+          fi
+          echo "目标提交 $SHA 上必须这些腿全部通过："
+          printf '  - %s\n' "${EXPECTED[@]}"
+
           WF=$(gh api "/repos/$GH_REPO/actions/workflows" \
                  --jq '.workflows[] | select(.path == ".github/workflows/tests.yml") | .id')
           [ -n "$WF" ] || { echo "::error::找不到 tests.yml 工作流"; exit 1; }
-          echo "tests workflow id: $WF, commit $SHA"
 
           # The tag push starts both workflows at once, so the run may not be
           # visible yet; wait for it before waiting on it.
           RUN=""
           for _ in $(seq 1 30); do
             RUN=$(gh api "/repos/$GH_REPO/actions/workflows/$WF/runs?head_sha=$SHA&per_page=50" \
-                    --jq '[.workflow_runs[] | select(.event == "push")] | .[0].id // ""')
+                    --jq '[.workflow_runs[] | select(.event == "push" or .event == "pull_request")]
+                          | sort_by(.created_at) | reverse | .[0].id // ""')
             [ -n "$RUN" ] && break
             sleep 10
           done
-          [ -n "$RUN" ] || { echo "::error::提交 $SHA 上没有 tests 运行（tag 未触发测试？）"; exit 1; }
+          [ -n "$RUN" ] || { echo "::error::提交 $SHA 上没有 tests 运行（tag/PR 未触发测试？）"; exit 1; }
           echo "waiting on run $RUN"
 
+          STATUS=timeout
           for _ in $(seq 1 150); do
             read -r STATUS CONCLUSION <<<"$(gh api "/repos/$GH_REPO/actions/runs/$RUN" \
                  --jq '"\(.status) \(.conclusion // "-")"')"
             case "$STATUS $CONCLUSION" in
-              "completed success")
-                echo "required tests passed: $GITHUB_SERVER_URL/$GH_REPO/actions/runs/$RUN"
-                exit 0 ;;
+              "completed success") break ;;
               "completed "*)
                 echo "::error::必需的测试没有通过（conclusion=$CONCLUSION）"
                 exit 1 ;;
             esac
             sleep 20
           done
-          echo "::error::等待 tests 运行超时"
-          exit 1
-      - name: Run every suite (rehearsal dispatch has no tag-triggered matrix)
-        if: github.event_name == 'workflow_dispatch'
+          [ "$STATUS" = "completed" ] || { echo "::error::等待 tests 运行超时"; exit 1; }
+
+          # The workflow conclusion alone is not enough: check every leg by
+          # name, so a matrix that lost a leg cannot pass this gate.
+          gh api "/repos/$GH_REPO/actions/runs/$RUN/jobs?per_page=100" \
+            --jq '.jobs[] | "\(.name)\t\(.conclusion)"' > jobs.tsv
+          cat jobs.tsv
+          MISSING=0
+          for leg in "${EXPECTED[@]}"; do
+            if awk -F'\t' -v n="$leg" '$1 == n && $2 == "success" { found = 1 } END { exit !found }' jobs.tsv; then
+              echo "  ok   $leg"
+            else
+              echo "::error::矩阵腿没有在 $SHA 上通过：$leg"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" = "0" ] || exit 1
+          echo "matrix=full" >> "$GITHUB_OUTPUT"
+          echo "required tests passed (full matrix): $GITHUB_SERVER_URL/$GH_REPO/actions/runs/$RUN"
+      - name: Run every suite (packaging-only dry run has no tag-triggered matrix)
+        if: steps.decide.outputs.writes != 'true'
         run: python tests/run_all.py --jobs 4
 
   # ---- 3. portable ZIP ----------------------------------------------------
+  # The green package ships a Windows runtime and the launchers start it as
+  # python\python.exe, so it is assembled and booted on Windows. Building it on
+  # Linux could only ever produce the source archive this asset must not be.
   portable:
     name: portable zip
     needs: [version, gate]
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
-      - name: Build the portable archive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read the pinned runtime
+        shell: pwsh
         run: |
-          set -euo pipefail
-          python release/release_tools.py portable \
-            --version "${{ needs.version.outputs.version }}" \
-            --tag "$TAG" \
+          python release/portable_runtime.py info | Tee-Object -FilePath "$env:RUNNER_TEMP\runtime.env"
+          Get-Content "$env:RUNNER_TEMP\runtime.env" >> $env:GITHUB_ENV
+      - name: Fetch the runtime (pinned, checksummed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Everything the job downloads or unpacks stays outside the checkout.
+          $cache = Join-Path $env:RUNNER_TEMP 'runtime-cache'
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          $out = Join-Path $cache $env:RUNTIME_ASSET
+          curl.exe -fsSL --retry 3 --retry-all-errors -o $out $env:RUNTIME_URL
+          if ($LASTEXITCODE -ne 0) { throw "运行时下载失败" }
+          $got = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $env:RUNTIME_SHA256) {
+            throw "运行时校验和不符：期望 $env:RUNTIME_SHA256，实际 $got"
+          }
+          $mb = [math]::Round((Get-Item $out).Length / 1MB, 1)
+          Write-Host "runtime tarball ok: $env:RUNTIME_ASSET ($mb MB, sha256 $got)"
+          "RUNTIME_TARBALL=$out" >> $env:GITHUB_ENV
+      - name: Trim the runtime
+        shell: pwsh
+        run: python release/portable_runtime.py prepare --tarball "$env:RUNTIME_TARBALL" --dest python
+      - name: Build the portable archive
+        shell: pwsh
+        run: |
+          python release/release_tools.py portable `
+            --version "${{ needs.version.outputs.version }}" `
+            --tag "$env:TAG" `
+            --runtime python `
             --out "dist/workbuddy2api-hub-v${{ needs.version.outputs.version }}.zip"
+      - name: Boot the packaged runtime
+        # Presence is not enough: the archive has to start the gateway with the
+        # interpreter it carries, which is what a user double-clicks.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Get-ChildItem dist/*.zip | Select-Object -First 1
+          $mb = [math]::Round($zip.Length / 1MB, 1)
+          Write-Host "package: $($zip.Name) ($mb MB)"
+          if ($zip.Length -lt 5MB) { throw "便携包只有 $mb MB，运行时没有进去" }
+
+          # Unpack outside the checkout: the smoke test is not allowed to leave
+          # anything behind in the repository.
+          $stage = Join-Path $env:RUNNER_TEMP 'smoke'
+          Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -Path $zip.FullName -DestinationPath $stage -Force
+          if (-not (Test-Path (Join-Path $stage 'release-manifest.json'))) {
+            throw "包内没有 release-manifest.json"
+          }
+          $root = Join-Path $stage 'wb-proxy'
+          if (-not (Test-Path $root)) { throw "包内没有 wb-proxy/ 目录" }
+          $py = Join-Path $root 'python\python.exe'
+          if (-not (Test-Path $py)) { throw "包内没有 python\python.exe" }
+
+          # The launcher has to look exactly where the runtime is.
+          $bat = Get-Content (Join-Path $root 'start-wb-proxy.bat') -Raw
+          if ($bat -notmatch 'python\\python\.exe') { throw "启动脚本没有找 python\python.exe" }
+
+          & $py --version
+          if ($LASTEXITCODE -ne 0) { throw "包内运行时无法执行" }
+          Push-Location $root
+          try {
+            & $py -c "import wb_proxy, wb_accounts, wb_pricing, wb_atrest, wb_webagent, wb_webtools, wb_scheduler, wb_tasks; print('app imports ok')"
+            if ($LASTEXITCODE -ne 0) { throw "包内运行时跑不动应用模块" }
+          } finally { Pop-Location }
+
+          $outLog = Join-Path $env:RUNNER_TEMP 'smoke-out.log'
+          $errLog = Join-Path $env:RUNNER_TEMP 'smoke-err.log'
+          $proc = Start-Process -FilePath $py `
+            -ArgumentList 'wb_proxy.py', '--host', '127.0.0.1', '--port', '8799' `
+            -WorkingDirectory $root -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 90; $i++) {
+              Start-Sleep -Milliseconds 500
+              try {
+                $r = Invoke-WebRequest 'http://127.0.0.1:8799/health' -UseBasicParsing -TimeoutSec 3
+                if ($r.StatusCode -eq 200) { $ok = $true; Write-Host "health: $($r.Content)"; break }
+              } catch { }
+            }
+            if (-not $ok) {
+              Write-Host "--- stdout ---"; Get-Content $outLog -ErrorAction SilentlyContinue
+              Write-Host "--- stderr ---"; Get-Content $errLog -ErrorAction SilentlyContinue
+              throw "便携包启动后 /health 没有响应"
+            }
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "portable package boots with its own runtime: $($zip.Name)"
       - name: Keep the archive
         uses: actions/upload-artifact@v4
         with:
@@ -289,12 +440,23 @@ jobs:
   # ---- 5. checksums + Draft Release ---------------------------------------
   draft:
     name: draft release
-    needs: [version, portable, openwrt]
+    needs: [version, gate, portable, openwrt]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+      - name: Refuse to write a release without the full matrix
+        # Belt and braces next to the gate job: the requirement is stated where
+        # the mutation happens, so no later reshuffle of `needs` can drop it.
+        if: github.event_name == 'push' || inputs.dry_run == 'false'
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.gate.outputs.matrix }}" != "full" ]; then
+            echo "::error::没有完整矩阵的授权（gate.matrix='${{ needs.gate.outputs.matrix }}'），拒绝创建/更新 Draft Release"
+            exit 1
+          fi
+          echo "full matrix confirmed for ${{ github.sha }}"
       - uses: actions/download-artifact@v4
         with:
           path: dist

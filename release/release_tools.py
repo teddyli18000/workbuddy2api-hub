@@ -27,6 +27,8 @@ import os
 import sys
 import zipfile
 
+import portable_runtime
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
@@ -34,6 +36,11 @@ MANIFEST = os.path.join(HERE, "portable.txt")
 MANIFEST_NAME = "release-manifest.json"
 MARKER = "<!-- release-download-block -->"
 SCHEMA = 1
+
+# The folder every packaged file lives under. The asset this replaces nests the
+# same way, so extracting gives one folder instead of a loose pile, and the
+# updater planned in #29 has a single prefix to strip (declared in the manifest).
+PACKAGE_ROOT = "wb-proxy"
 
 # Paths the updater must never touch. They travel with the archive's manifest
 # so #29 can assert the contract instead of hardcoding it a second time.
@@ -72,23 +79,56 @@ def _zip_date(epoch):
     return (t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)
 
 
-def build_portable(version, tag, out_path, source=ROOT, epoch=DEFAULT_EPOCH):
-    """Write the portable ZIP and return (path, [managed files])."""
+def build_portable(version, tag, out_path, source=ROOT, runtime_dir=None,
+                   root=PACKAGE_ROOT, epoch=DEFAULT_EPOCH):
+    """Write the portable ZIP and return (path, [managed files]).
+
+    `runtime_dir` is the trimmed CPython the launchers look for under
+    `python/`. It is required: the asset this replaces is the green package,
+    and a ZIP without the runtime is a different, much less useful thing.
+    """
     got = source_version(source)
     if got != version:
         raise SystemExit("版本不一致：wb_proxy.py=%s，参数=%s" % (got, version))
+    if not runtime_dir or not os.path.isdir(runtime_dir):
+        raise SystemExit("缺少 --runtime：便携包必须带 python/ 运行时"
+                         "（先用 release/portable_runtime.py prepare 生成）")
+    portable_runtime.verify(runtime_dir)
 
     files = read_manifest()
     missing = [p for p in files if not os.path.isfile(os.path.join(source, p))]
     if missing:
         raise SystemExit("清单里的文件不存在：%s" % ", ".join(missing))
 
+    entries = []
+    for name in files:
+        with open(os.path.join(source, name), "rb") as fh:
+            entries.append(("%s/%s" % (root, name), fh.read(), 0o644))
+    runtime_files = 0
+    for dirpath, _dirnames, filenames in os.walk(runtime_dir):
+        for fn in filenames:
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, runtime_dir).replace(os.sep, "/")
+            with open(full, "rb") as fh:
+                entries.append(("%s/python/%s" % (root, rel), fh.read(), 0o755))
+            runtime_files += 1
+
     manifest = {
         "schema": SCHEMA,
         "name": "workbuddy2api-hub",
         "version": version,
         "tag": tag,
+        # Everything below `files` lives under this folder, so an updater can
+        # strip the prefix without guessing the archive's shape.
+        "root": root,
         "files": files,
+        # The runtime is one managed subtree rather than 500 manifest lines.
+        "runtime": {
+            "prefix": "python/",
+            "python": portable_runtime.RUNTIME_VERSION,
+            "source": portable_runtime.RUNTIME_URL,
+            "files": runtime_files,
+        },
         "protected": PROTECTED,
     }
     blob = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
@@ -96,18 +136,18 @@ def build_portable(version, tag, out_path, source=ROOT, epoch=DEFAULT_EPOCH):
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     when = _zip_date(epoch)
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        # Sorted so the same checkout gives a byte-identical archive.
-        for name in sorted(files) + [MANIFEST_NAME]:
-            if name == MANIFEST_NAME:
-                data = blob.encode("utf-8")
-            else:
-                with open(os.path.join(source, name), "rb") as fh:
-                    data = fh.read()
+        # Sorted so the same inputs give a byte-identical archive.
+        for name, data, mode in sorted(entries, key=lambda e: e[0]):
             info = zipfile.ZipInfo(name, date_time=when)
-            info.external_attr = 0o644 << 16
+            info.external_attr = mode << 16
             info.compress_type = zipfile.ZIP_DEFLATED
             info.create_system = 3  # Unix, so the mode above survives
             zf.writestr(info, data)
+        info = zipfile.ZipInfo(MANIFEST_NAME, date_time=when)
+        info.external_attr = 0o644 << 16
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.create_system = 3
+        zf.writestr(info, blob.encode("utf-8"))
     return out_path, files
 
 
@@ -176,7 +216,22 @@ def asset_names(version, release):
     )
 
 
+def _utf8_stdio():
+    """Let the progress lines survive a non-UTF-8 console.
+
+    Windows runners hand Python a cp1252 stdout, and the first Chinese summary
+    line then dies with UnicodeEncodeError. The repository already paid for this
+    once in tests/run_all.py; the same two lines fix it here.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv=None):
+    _utf8_stdio()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
@@ -188,6 +243,10 @@ def main(argv=None):
     p.add_argument("--tag", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--source", default=ROOT)
+    p.add_argument("--runtime", required=True,
+                   help="trimmed CPython tree (release/portable_runtime.py prepare)")
+    p.add_argument("--root", default=PACKAGE_ROOT,
+                   help="folder every packaged file lives under (default %s)" % PACKAGE_ROOT)
     p.add_argument("--epoch", type=int, default=int(os.environ.get("SOURCE_DATE_EPOCH", DEFAULT_EPOCH)))
 
     c = sub.add_parser("checksums", help="write SHA256SUMS")
@@ -209,8 +268,10 @@ def main(argv=None):
 
     if args.cmd == "portable":
         path, files = build_portable(args.version, args.tag, args.out,
-                                     source=args.source, epoch=args.epoch)
-        print("portable: %s（%d 个受管文件 + %s）" % (path, len(files), MANIFEST_NAME))
+                                     source=args.source, runtime_dir=args.runtime,
+                                     root=args.root, epoch=args.epoch)
+        print("portable: %s（%d 个受管文件 + python/ 运行时 %s + %s）"
+              % (path, len(files), portable_runtime.RUNTIME_VERSION, MANIFEST_NAME))
         print("sha256  : %s" % sha256(path))
         return 0
 
