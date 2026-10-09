@@ -63,19 +63,76 @@ def make_runtime(directory, extra=()):
 
 # ---- "only a tag push may write a release" --------------------------------
 #
-# A release mutation is a command that is actually run: either a line that
-# starts with it (inside a `run: |` block) or a one-line `run:` step. The
-# preview job is allowed to *print* the same commands inside an echo, so
-# matching the text anywhere would flag the wrong job - anchoring on the
-# command position is what separates "runs it" from "talks about it".
-MUTATION_LINE = re.compile(
-    r"^\s*(?:"
-    r"gh\s+(?:release\s+(?:create|edit|upload|delete)"
-    r"|api\b[^\n]*(?:-X|--method)\s*(?:PATCH|POST|PUT|DELETE))"
-    r"|run:\s*gh\s+(?:release\s+(?:create|edit|upload|delete)|api\b)"
-    r")",
-    re.MULTILINE,
-)
+# A release mutation is a command the workflow actually *runs*: one that sits at
+# command position, either on its own line inside a `run: |` block, after a
+# one-line `run:`, or behind a shell separator. The preview job is allowed to
+# *print* the same commands inside an echo, so matching the text anywhere would
+# flag the wrong job - command position is what separates "runs it" from
+# "talks about it".
+# `gh api` is the subtle half. It defaults to GET, but *any* field flag turns
+# the request into a POST, so `gh api repos/o/r/releases -f tag_name=v1` creates
+# a release without ever naming a method. Only an explicit `-X GET` /
+# `--method GET` says the call is a read.
+#
+# The scanner is deliberately conservative: it treats *every* writing `gh api`
+# as a release writer rather than trying to recognise release URLs, because a
+# miss means a release written from a manual run, while a false positive only
+# means moving one command into the writer job.
+
+# `gh release <verb>` - the four verbs that change a release.
+GH_RELEASE_WRITE = re.compile(r"^gh\s+release\s+(?:create|edit|upload|delete)\b")
+GH_API = re.compile(r"^gh\s+api\b")
+# `-X POST`, `-XPOST`, `--method POST`, `--method=POST`.
+API_METHOD = re.compile(r"(?:^|\s)(?:-X|--method)(?:[=\s]*)([A-Za-z]+)")
+# Flags that make gh send a body, which is what flips the default to POST.
+API_BODY_FLAG = re.compile(r"(?:^|\s)(?:-f|-F|--field|--raw-field|--input)(?:=|\s|$)")
+
+# Fragments a shell command can be split into. Pipes are left alone on purpose:
+# splitting on `|` would slice through quoted strings for no gain here.
+SHELL_SEPARATOR = re.compile(r"&&|\|\||;")
+# A one-line step carries its command after `run:` (possibly as a list item).
+INLINE_RUN = re.compile(r"^(?:-\s*)?run:\s*")
+
+
+def shell_commands(text):
+    """Logical shell commands in a workflow, with `\\` continuations joined.
+
+    Only line continuations are normalised - this is not a shell parser and
+    does not try to be one.
+    """
+    joined, buf = [], ""
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if line.endswith("\\"):
+            buf += line[:-1] + " "
+            continue
+        joined.append(buf + line)
+        buf = ""
+    if buf:
+        joined.append(buf)
+
+    for line in joined:
+        for piece in SHELL_SEPARATOR.split(line):
+            piece = INLINE_RUN.sub("", piece.strip())
+            if piece:
+                yield piece
+
+
+def is_release_mutation(command):
+    """Would running this command change a GitHub Release?"""
+    if GH_RELEASE_WRITE.match(command):
+        return True
+    if not GH_API.match(command):
+        return False
+    method = API_METHOD.search(command)
+    if method:
+        return method.group(1).upper() != "GET"
+    return bool(API_BODY_FLAG.search(command))
+
+
+def release_mutations(text):
+    """The release-mutating commands a piece of workflow text runs."""
+    return [c for c in shell_commands(text) if is_release_mutation(c)]
 # The one guard that makes a job unreachable from a manual run: a dispatch has
 # neither this event nor a tag ref, so no input combination can satisfy it.
 TAG_PUSH_GUARD = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
@@ -156,7 +213,7 @@ def dispatch_input_names(text):
 def release_writer_jobs(text):
     """Jobs that run at least one release-mutating command."""
     return sorted(name for name, body in workflow_jobs(text).items()
-                  if MUTATION_LINE.search(body))
+                  if release_mutations(body))
 
 
 def check_release_writers(text):
@@ -485,6 +542,73 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn('PYTHONUTF8: "1"', read(".github", "workflows", "release.yml"))
 
 
+class ReleaseMutationScannerTests(unittest.TestCase):
+    """The command shapes the scanner has to classify, and how.
+
+    Kept as a table so the contract is readable: everything in WRITES must be
+    caught, everything in READS must not be. `gh api` is the interesting half -
+    it defaults to GET, but any body flag turns the call into a POST.
+    """
+
+    WRITES = (
+        "gh release create \"$TAG\" --draft",
+        "gh release edit \"$TAG\" --draft",
+        "gh release upload \"$TAG\" dist/*.zip --clobber",
+        "gh release delete \"$TAG\" --yes",
+        "gh api repos/o/r/releases -X POST -f tag_name=v1",
+        "gh api -XPOST repos/o/r/releases",
+        "gh api --method PATCH repos/o/r/releases/1",
+        "gh api --method=DELETE repos/o/r/releases/1",
+        "gh api repos/o/r/releases -f tag_name=v1",
+        "gh api repos/o/r/releases -F tag_name=@body.json",
+        "gh api repos/o/r/releases --field tag_name=v1",
+        "gh api repos/o/r/releases --raw-field tag_name=v1",
+        "gh api repos/o/r/releases --input body.json",
+    )
+    READS = (
+        "gh release view \"$TAG\" --json body",
+        "gh release list --limit 5",
+        "gh api repos/o/r/releases",
+        "gh api -X GET repos/o/r/releases -f per_page=1",
+        "gh api --method=GET repos/o/r/releases",
+        "gh api --method GET repos/o/r/releases/tags/$TAG",
+        "echo \"gh release create $TAG --draft\"",
+        "python release/release_tools.py checksums --out dist/SHA256SUMS",
+        "git push --force-with-lease origin main",
+    )
+
+    def test_every_writing_shape_is_a_mutation(self):
+        for command in self.WRITES:
+            self.assertTrue(is_release_mutation(command), command)
+
+    def test_every_read_only_shape_is_not_a_mutation(self):
+        for command in self.READS:
+            self.assertFalse(is_release_mutation(command), command)
+
+    def test_continuations_are_joined_before_the_decision(self):
+        text = ("        run: |\n"
+                "          gh api \\\n"
+                "            repos/o/r/releases \\\n"
+                "            -f tag_name=v1\n")
+        found = release_mutations(text)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].split(),
+                         ["gh", "api", "repos/o/r/releases", "-f", "tag_name=v1"])
+
+    def test_a_shell_separator_does_not_hide_a_command(self):
+        text = "        run: true && gh release delete \"$TAG\" --yes\n"
+        self.assertEqual(release_mutations(text), ["gh release delete \"$TAG\" --yes"])
+
+    def test_an_echo_of_a_command_is_not_a_mutation(self):
+        text = "        run: |\n          echo \"gh release create $TAG --draft\"\n"
+        self.assertEqual(release_mutations(text), [])
+
+    def test_the_real_workflow_only_writes_from_one_job(self):
+        text = read(".github", "workflows", "release.yml")
+        self.assertEqual(release_writer_jobs(text), ["write-draft"])
+        self.assertTrue(release_mutations(workflow_jobs(text)["write-draft"]))
+
+
 class ReleaseWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.text = read(".github", "workflows", "release.yml")
@@ -601,10 +725,64 @@ class ReleaseWorkflowTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_release_writers(mutated)
 
+    def test_the_checker_rejects_an_implicit_post_that_creates_a_release(self):
+        # The round-3 scanner only knew explicit `-X POST|PATCH|PUT|DELETE`, so
+        # this line created a release from a dispatch-reachable job without ever
+        # naming a method: gh defaults to POST as soon as a field flag is there.
+        # Committed on purpose - it is the regression this scanner exists for.
+        mutated = self.text.replace(
+            "      - name: Show what a tag push would do\n",
+            "      - name: sneak a release in\n        run: |\n"
+            "          gh api \"repos/$GH_REPO/releases\" -f tag_name=\"$TAG\" -f draft=true\n"
+            "      - name: Show what a tag push would do\n", 1)
+        self.assertNotEqual(mutated, self.text)
+        self.assertIn("-f tag_name=", mutated)
+        with self.assertRaises(AssertionError):
+            check_release_writers(mutated)
+
+    def test_the_checker_rejects_an_implicit_post_split_over_continuations(self):
+        mutated = self.text.replace(
+            "      - name: Show what a tag push would do\n",
+            "      - name: sneak a release in\n        run: |\n"
+            "          gh api \\\n"
+            "            \"repos/$GH_REPO/releases\" \\\n"
+            "            --field tag_name=\"$TAG\" \\\n"
+            "            --raw-field draft=true\n"
+            "      - name: Show what a tag push would do\n", 1)
+        self.assertNotEqual(mutated, self.text)
+        with self.assertRaises(AssertionError):
+            check_release_writers(mutated)
+
+    def test_the_checker_rejects_a_write_split_over_continuations(self):
+        mutated = self.text.replace(
+            "      - name: Show what a tag push would do\n",
+            "      - name: sneak a write in\n        run: |\n"
+            "          gh release \\\n            create \"$TAG\" --draft\n"
+            "      - name: Show what a tag push would do\n", 1)
+        self.assertNotEqual(mutated, self.text)
+        with self.assertRaises(AssertionError):
+            check_release_writers(mutated)
+
+    def test_a_read_only_api_call_in_another_job_is_not_flagged(self):
+        # The other half of the contract: an explicit GET stays legal anywhere,
+        # even when it carries fields. A scanner that flagged this would push
+        # people to weaken the check instead of fixing it.
+        read_only = self.text.replace(
+            "      - name: Show what a tag push would do\n",
+            "      - name: peek at the release\n        run: |\n"
+            "          gh api -X GET \"repos/$GH_REPO/releases\" -f per_page=1\n"
+            "          gh api --method=GET \"repos/$GH_REPO/releases/tags/$TAG\"\n"
+            "      - name: Show what a tag push would do\n", 1)
+        self.assertNotEqual(read_only, self.text)
+        check_release_writers(read_only)
+        self.assertEqual(release_writer_jobs(read_only), ["write-draft"])
+
     def test_the_checker_notices_when_it_finds_no_writer_at_all(self):
         # If every writer disappears the checker must complain rather than pass
         # vacuously.
-        mutated = MUTATION_LINE.sub("true ", self.text)
+        mutated = self.text
+        for verb in ("create", "edit", "upload"):
+            mutated = mutated.replace("gh release %s" % verb, "true ")
         self.assertNotEqual(mutated, self.text)
         with self.assertRaises(AssertionError):
             check_release_writers(mutated)
