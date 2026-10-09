@@ -27,24 +27,21 @@ name: release
 # exactly the same path, but the draft is also marked prerelease, so a rehearsal
 # release can never be picked up by the updater planned in #29 (it ignores
 # prereleases).
+#
+# A manual run cannot write a release at all. `workflow_dispatch` is
+# packaging-only: it builds and hashes exactly what a tag push would, prints the
+# commands that would follow, and stops. The release writer lives in its own job
+# whose `if:` is the one condition below, so no input combination can reach it -
+# tests/_test_release_assets.py pins that, including a self-test proving the
+# check fails when a writer is moved onto the dispatch path.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "已存在的 tag（演练可用 -ci 后缀，例如 v1.6.17-ci）"
+        description: "已存在的 tag（手动运行只做打包演练，不创建/更新任何 release）"
         required: true
-      dry_run:
-        description: "只打包与校验，不创建/更新任何 release"
-        # A string, not a boolean: the `inputs` context hands booleans back as
-        # strings on some paths, and `!inputs.dry_run` would then be false for
-        # both "true" and "false". Comparing against 'false' is unambiguous.
-        type: choice
-        options:
-          - "true"
-          - "false"
-        default: "true"
 
 permissions:
   contents: write
@@ -146,16 +143,14 @@ jobs:
         run: |
           set -euo pipefail
           WRITES=false
-          if [ "${{ github.event_name }}" = "push" ]; then
-            WRITES=true
-          elif [ "${{ inputs.dry_run }}" = "false" ]; then
-            WRITES=true
-          fi
+          case "${{ github.event_name }}:${{ github.ref }}" in
+            push:refs/tags/v*) WRITES=true ;;
+          esac
           echo "writes=$WRITES" >> "$GITHUB_OUTPUT"
           if [ "$WRITES" = "true" ]; then
-            echo "本 run 会写 Draft Release：必须先在目标提交上拿到完整矩阵"
+            echo "v* tag 推送：必须先拿到完整矩阵，之后才允许写 Draft Release"
           else
-            echo "packaging-only 演练（dry_run=true）：不碰任何 release，单 OS 跑一遍套件即可"
+            echo "手动运行：packaging-only，任何输入都不会写 release，单 OS 跑一遍套件即可"
           fi
       - name: Require the full matrix for this commit
         # Only a full matrix may authorise a release mutation. The legs come
@@ -437,26 +432,18 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # ---- 5. checksums + Draft Release ---------------------------------------
-  draft:
-    name: draft release
+  # ---- 5. checksums + preview ---------------------------------------------
+  # Runs for a tag push *and* for a manual packaging run. It reads releases
+  # (to keep the maintainer's notes) but never writes one: everything it
+  # produces goes into an artifact for the writer below, or to the log.
+  draft-preview:
+    name: draft preview
     needs: [version, gate, portable, openwrt]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
-      - name: Refuse to write a release without the full matrix
-        # Belt and braces next to the gate job: the requirement is stated where
-        # the mutation happens, so no later reshuffle of `needs` can drop it.
-        if: github.event_name == 'push' || inputs.dry_run == 'false'
-        run: |
-          set -euo pipefail
-          if [ "${{ needs.gate.outputs.matrix }}" != "full" ]; then
-            echo "::error::没有完整矩阵的授权（gate.matrix='${{ needs.gate.outputs.matrix }}'），拒绝创建/更新 Draft Release"
-            exit 1
-          fi
-          echo "full matrix confirmed for ${{ github.sha }}"
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -496,15 +483,60 @@ jobs:
             --release "${{ needs.version.outputs.release }}" \
             --existing dist/existing-body.md --out dist/release-body.md
           cat dist/release-body.md
-      - name: Show what a rehearsal would do
-        if: github.event_name == 'workflow_dispatch' && inputs.dry_run != 'false'
+      - name: Show what a tag push would do
+        # A manual run stops here on purpose. The commands are printed, not
+        # run: reaching the writer takes a v* tag.
+        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          echo "dry-run：不会创建或改动任何 release。真实执行时会运行："
-          echo "  gh release create|edit $TAG --draft --prerelease --notes-file dist/release-body.md"
-          echo "  gh release upload $TAG dist/*.zip dist/*.ipk dist/*.apk dist/SHA256SUMS --clobber"
+          echo "手动运行到此为止：不会创建或改动任何 release。推送 $TAG 时会执行："
+          echo "  1) 校验 tag / 源码 / wrt Makefile 三处版本一致"
+          echo "  2) 等目标提交上的完整矩阵（Ubuntu 3.9 + Ubuntu 3.12 + Windows 3.12）全绿"
+          echo "  3) 创建或更新 Draft Release（--draft，永不 publish）并上传 dist/ 下的资产"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: |
+            dist/SHA256SUMS
+            dist/release-body.md
+          if-no-files-found: error
+
+  # ---- 6. the only release writer -----------------------------------------
+  # The single condition under which a GitHub Release may be created, edited or
+  # uploaded to. `workflow_dispatch` cannot satisfy it - its ref is a branch and
+  # its event is not `push` - so no input combination reaches this job.
+  # tests/_test_release_assets.py pins that, and proves the check has teeth.
+  write-draft:
+    name: write draft release
+    needs: [version, gate, draft-preview]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Refuse to write a release without the full matrix
+        # Belt and braces next to the gate job: the requirement is stated where
+        # the mutation happens, so no later reshuffle of `needs` can drop it.
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.gate.outputs.matrix }}" != "full" ]; then
+            echo "::error::没有完整矩阵的授权（gate.matrix='${{ needs.gate.outputs.matrix }}'），拒绝创建/更新 Draft Release"
+            exit 1
+          fi
+          echo "full matrix confirmed for ${{ github.sha }}"
+      - name: Verify the checksums against the assets about to be uploaded
+        # The list has to describe the final artifacts, so it is checked here
+        # against the files this job just downloaded rather than trusted.
+        run: |
+          set -euo pipefail
+          ls -l dist
+          (cd dist && sha256sum -c SHA256SUMS)
       - name: Create or update the Draft Release
-        if: github.event_name == 'push' || inputs.dry_run == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -528,7 +560,6 @@ jobs:
           fi
           gh release upload "$TAG" dist/*.zip dist/*.ipk dist/*.apk dist/SHA256SUMS --clobber
       - name: Prove the release is still a draft
-        if: github.event_name == 'push' || inputs.dry_run == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

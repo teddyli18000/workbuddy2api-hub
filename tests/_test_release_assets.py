@@ -23,6 +23,7 @@ import ast
 import glob
 import hashlib
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -58,6 +59,117 @@ def make_runtime(directory, extra=()):
         with open(path, "wb") as fh:
             fh.write(b"stub:" + rel.encode("utf-8"))
     return directory
+
+
+# ---- "only a tag push may write a release" --------------------------------
+#
+# A release mutation is a command that is actually run: either a line that
+# starts with it (inside a `run: |` block) or a one-line `run:` step. The
+# preview job is allowed to *print* the same commands inside an echo, so
+# matching the text anywhere would flag the wrong job - anchoring on the
+# command position is what separates "runs it" from "talks about it".
+MUTATION_LINE = re.compile(
+    r"^\s*(?:"
+    r"gh\s+(?:release\s+(?:create|edit|upload|delete)"
+    r"|api\b[^\n]*(?:-X|--method)\s*(?:PATCH|POST|PUT|DELETE))"
+    r"|run:\s*gh\s+(?:release\s+(?:create|edit|upload|delete)|api\b)"
+    r")",
+    re.MULTILINE,
+)
+# The one guard that makes a job unreachable from a manual run: a dispatch has
+# neither this event nor a tag ref, so no input combination can satisfy it.
+TAG_PUSH_GUARD = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+
+
+def workflow_jobs(text):
+    """{job id: job text} for the top-level `jobs:` mapping of a workflow."""
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.rstrip() == "jobs:":
+            start = i
+            break
+    if start is None:
+        return {}
+    jobs, current, buf = {}, None, []
+    for line in lines[start + 1:]:
+        if not line.strip():
+            if current:
+                buf.append(line)
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            break
+        if indent == 2 and not line.lstrip().startswith("#") and line.rstrip().endswith(":"):
+            if current:
+                jobs[current] = "\n".join(buf)
+            current = line.strip()[:-1]
+            buf = []
+            continue
+        if current is not None:
+            buf.append(line)
+    if current:
+        jobs[current] = "\n".join(buf)
+    return jobs
+
+
+def job_guard(job_text):
+    """The job-level `if:` value, or '' when the job has none."""
+    header = []
+    for line in job_text.splitlines():
+        if line.strip() == "steps:":
+            break
+        header.append(line)
+    match = re.search(r"(?m)^\s*if:\s*(.+?)\s*$", "\n".join(header))
+    return match.group(1) if match else ""
+
+
+def dispatch_input_names(text):
+    """Input names declared under `on.workflow_dispatch.inputs`."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() != "workflow_dispatch:":
+            continue
+        parent = len(line) - len(line.lstrip())
+        for j in range(i + 1, len(lines)):
+            cur = lines[j]
+            if not cur.strip() or cur.lstrip().startswith("#"):
+                continue
+            indent = len(cur) - len(cur.lstrip())
+            if indent <= parent:
+                break
+            if cur.strip() != "inputs:":
+                continue
+            names = []
+            for nxt in lines[j + 1:]:
+                if not nxt.strip() or nxt.lstrip().startswith("#"):
+                    continue
+                nind = len(nxt) - len(nxt.lstrip())
+                if nind <= indent:
+                    break
+                if nind == indent + 2 and nxt.strip().endswith(":"):
+                    names.append(nxt.strip()[:-1])
+            return names
+    return []
+
+
+def release_writer_jobs(text):
+    """Jobs that run at least one release-mutating command."""
+    return sorted(name for name, body in workflow_jobs(text).items()
+                  if MUTATION_LINE.search(body))
+
+
+def check_release_writers(text):
+    """Raise AssertionError unless only a tag push can reach a release writer."""
+    writers = release_writer_jobs(text)
+    assert writers, "没找到任何 release 写入点——检查器本身失效了，不是工作流变干净了"
+    for name in writers:
+        guard = job_guard(workflow_jobs(text)[name])
+        assert guard == TAG_PUSH_GUARD, (
+            "job %s 会写 release，但它的 if: 不是 tag 推送（实际 %r）" % (name, guard))
+    inputs = dispatch_input_names(text)
+    assert inputs == ["tag"], (
+        "workflow_dispatch 只能有 tag 一个输入，实际是 %s" % inputs)
 
 
 class ManifestTests(unittest.TestCase):
@@ -421,19 +533,81 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("release/matrix_legs.py", self.text)
         self.assertIn("matrix=full", self.text)
         self.assertIn("needs.gate.outputs.matrix", self.text)
-        for line in self.text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("if: github.event_name == 'push'"):
-                # Every release-writing step is guarded by the same condition,
-                # and each of them is preceded by the matrix requirement.
-                self.assertIn("inputs.dry_run", stripped, stripped)
         self.assertIn("writes == 'true'", self.text)
         # The authorisation has to come from the step that checks the legs; an
-        # output wired to the wrong step is empty, and the draft job then
-        # refuses the write (which is how the first run caught this).
+        # output wired to the wrong step is empty, and the writer then refuses
+        # the mutation (which is how the first run caught this).
         gate = self.text.split("  gate:", 1)[1].split("\n  portable:", 1)[0]
         self.assertIn("matrix: ${{ steps.matrix.outputs.matrix }}", gate)
         self.assertIn("id: matrix", gate)
+
+    # ---- only a tag push may write a release -------------------------------
+    #
+    # A manual run builds and hashes exactly what a tag push would, then stops.
+    # The writer is a separate job whose `if:` a dispatch cannot satisfy, and
+    # the checks below fail if that ever stops being true.
+
+    def test_only_a_tag_push_can_reach_the_release_writer(self):
+        check_release_writers(self.text)
+        self.assertEqual(release_writer_jobs(self.text), ["write-draft"])
+
+    def test_the_writer_guard_is_the_tag_push_condition(self):
+        jobs = workflow_jobs(self.text)
+        self.assertEqual(job_guard(jobs["write-draft"]), TAG_PUSH_GUARD)
+        # The preview job runs for both events, so it must stay read-only.
+        self.assertEqual(release_writer_jobs(self.text).count("draft-preview"), 0)
+        self.assertIn("gh release view", jobs["draft-preview"])
+
+    def test_dispatch_declares_no_input_that_could_authorise_a_write(self):
+        self.assertEqual(dispatch_input_names(self.text), ["tag"])
+        self.assertNotIn("inputs.dry_run", self.text)
+        self.assertNotIn("dry_run", self.text)
+
+    def test_the_checker_rejects_a_writer_moved_onto_the_dispatch_path(self):
+        # Negative evidence, kept in the suite: a checker that cannot fail
+        # proves nothing. Moving the writer onto the dispatch path has to be
+        # caught, or the checks above are decoration.
+        mutated = self.text.replace(TAG_PUSH_GUARD,
+                                    "github.event_name == 'workflow_dispatch'")
+        self.assertNotEqual(mutated, self.text)
+        with self.assertRaises(AssertionError):
+            check_release_writers(mutated)
+
+    def test_the_checker_rejects_a_mutation_hidden_in_another_job(self):
+        mutated = self.text.replace(
+            "      - name: Show what a tag push would do\n",
+            "      - name: sneak a write in\n        run: |\n"
+            "          gh release delete \"$TAG\" --yes\n"
+            "      - name: Show what a tag push would do\n", 1)
+        self.assertNotEqual(mutated, self.text)
+        with self.assertRaises(AssertionError):
+            check_release_writers(mutated)
+
+    def test_the_checker_rejects_a_one_line_run_step(self):
+        # The short form is just as much a writer as the block form.
+        mutated = self.text.replace(
+            "      - name: Show what a tag push would do\n",
+            "      - name: sneak a write in\n        run: gh release delete \"$TAG\" --yes\n"
+            "      - name: Show what a tag push would do\n", 1)
+        self.assertNotEqual(mutated, self.text)
+        with self.assertRaises(AssertionError):
+            check_release_writers(mutated)
+
+    def test_the_checker_rejects_a_dispatch_input_that_could_gate_a_write(self):
+        mutated = self.text.replace(
+            "    inputs:\n      tag:\n",
+            "    inputs:\n      tag:\n      dry_run:\n        description: \"x\"\n", 1)
+        self.assertNotEqual(mutated, self.text)
+        with self.assertRaises(AssertionError):
+            check_release_writers(mutated)
+
+    def test_the_checker_notices_when_it_finds_no_writer_at_all(self):
+        # If every writer disappears the checker must complain rather than pass
+        # vacuously.
+        mutated = MUTATION_LINE.sub("true ", self.text)
+        self.assertNotEqual(mutated, self.text)
+        with self.assertRaises(AssertionError):
+            check_release_writers(mutated)
 
     def test_a_reduced_run_only_ever_packages(self):
         # The single-OS suite may run for a packaging-only dry run and nowhere
