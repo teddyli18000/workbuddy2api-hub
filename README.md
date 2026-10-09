@@ -23,7 +23,7 @@
 - **限额（保留积分 · 每日 Token · 每日积分 · 按模型 Token）**：四条账号级护栏集中在看板同一张表里，默认按**全局默认**生效、同时管住国际版与国内版；需要时可单独给某一版本设值，留空即继承全局。积分花超只服务免费模型、单模型 token 用满只禁该模型，次日 0 点解封（默认全部关闭）；
 - **OpenRouter 价估算**：把请求 token 按 OpenRouter 公布的模型价折算成等价花费（按条件定价的模型按每条请求的输入长度与时间取档），定价按版本留档、刷新间隔可配，每条请求都标出用的是哪一版，人民币/美元可切，看板多处并列展示；**上游新增模型无需改代码即可自动进入取价**（取价输入 = 内置目录 ∪ 网关实时目录；两次取价之间就被调用就按需补价；带渠道后缀的名字向基准模型继承，命不中就不定价），仍未定价的模型在面板列出原因，可手填 OpenRouter id 收口；
 - **三协议支持**：Chat Completions、Responses API（Codex）与原生 Anthropic Messages API（Claude Code / Anthropic SDK）；
-- 90 个套件：68 个 Python + 22 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 91 个套件：69 个 Python + 22 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - **积分与权益包明细查看**：完整解析账号各套餐包/加量包额度、已用、剩余、生效状态及有效期周期，看板一键弹窗并支持实时刷新；
 - **Web 看板**：指标卡片、模型性能与用量大表、按 API Key 的用量归属、实时请求流水一屏可查。
 
@@ -171,7 +171,7 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
-- 90 个套件：68 个 Python + 22 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 91 个套件：69 个 Python + 22 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12。推送 `v*` tag 时额外断言 **tag == 源码版本**（`wb_proxy.py` 里的两处版本串必须先一致，`-ci` 演练 tag 豁免）。
 
 ### 7. 发布与打包（维护者）

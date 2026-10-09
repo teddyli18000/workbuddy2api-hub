@@ -38,6 +38,8 @@ allow-firewall.command
 pricing/pricing.json
 
 wb_accounts.py
+wb_activity.py
+wb_agents.py
 wb_atrest.py
 wb_catalog.py
 wb_fingerprint.py
@@ -51,5 +53,6 @@ wb_proxy.py
 wb_scheduler.py
 wb_settings.py
 wb_tasks.py
+wb_updates.py
 wb_webagent.py
 wb_webtools.py
