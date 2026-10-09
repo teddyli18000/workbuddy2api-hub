@@ -91,6 +91,9 @@ const rowFor = (html, name) => {
   return hits.length === 1 ? hits[0] : null;
 };
 const show = (row, label) => row === null ? '(no single row)' : JSON.stringify(cellOf(row, label));
+// Same read, but tolerant of a missing row so a later check reports a failed
+// value instead of throwing over one [1b] has already called out.
+const cellIn = (row, label) => row === null ? '' : (cellOf(row, label) || '');
 
 console.log();
 console.log('[1b] every per-key label is bound to the row it describes');
@@ -128,27 +131,59 @@ check('the pre-upgrade bucket row shows no exit instead of guessing one',
 check('the no-key bucket row shows no exit either',
       noKeyRow !== null && cellOf(noKeyRow, '出口').includes('—'),
       show(noKeyRow, '出口'));
-check('the launcher key is attributed to the start-up argument', out.includes('启动参数'));
-check('panel keys are marked as panel keys', out.includes('面板 Key'));
-check('failures are surfaced next to the request count', out.includes('失败 1'));
-check('the credit column is fixed to two decimals', out.includes('3.50'));
-check('cache hit is rendered as a percentage', out.includes('12.5%'));
+console.log();
+console.log('[1c] the remaining per-key values are read from their own row');
+// Each of these reads its own row *and* checks the contrast row did not
+// inherit the value. Pinning 甲's numbers alone would still pass if every row
+// rendered 甲's numbers, which is exactly what a hoisted `st` does.
+check('the launcher key carries its own source label',
+      cellIn(intlRow, 'API Key').includes('启动参数'),
+      show(intlRow, 'API Key'));
+check('a panel key carries the panel source label on its own row',
+      cellIn(cnRow, 'API Key').includes('面板 Key'),
+      show(cnRow, 'API Key'));
+check('the request count and its failures belong to the key that had them',
+      cellIn(cnRow, '请求次数').includes('12 次')
+      && cellIn(cnRow, '请求次数').includes('失败 1')
+      && !cellIn(crossRow, '请求次数').includes('失败'),
+      show(cnRow, '请求次数') + '  vs  ' + show(crossRow, '请求次数'));
+check('the credit is two decimals on the row that earned it, and not elsewhere',
+      cellIn(cnRow, '消耗积分').includes('3.50')
+      && !cellIn(crossRow, '消耗积分').includes('3.50'),
+      show(cnRow, '消耗积分') + '  vs  ' + show(crossRow, '消耗积分'));
+check('the cache-hit percentage belongs to the row that has one',
+      cellIn(cnRow, '缓存命中').includes('12.5%')
+      && !cellIn(crossRow, '缓存命中').includes('12.5%'),
+      show(cnRow, '缓存命中') + '  vs  ' + show(crossRow, '缓存命中'));
 
 console.log();
 console.log('[2] the unattributed rows stay distinguishable');
-check('(切换前) is rendered', out.includes('(切换前)'));
-check('(无 key) is rendered separately', out.includes('(无 key)'));
-check('bucket rows show no exit instead of guessing one',
-      (out.match(/—<\/span><\/td>/g) || []).length === 2,
-      (out.match(/—<\/span><\/td>/g) || []).length);
+check('each bucket row is named on its own row, and they are different rows',
+      cellIn(beforeRow, 'API Key').includes('(切换前)')
+      && cellIn(noKeyRow, 'API Key').includes('(无 key)'),
+      show(beforeRow, 'API Key') + '  vs  ' + show(noKeyRow, 'API Key'));
+// "bucket rows show no exit" used to count —</span></td> table-wide. Read the
+// 出口 cell of every row instead, so the count has to be those two rows.
+const noExit = rowsOf(out).filter(r => (cellOf(r, '出口') || '').includes('—'));
+check('exactly the two bucket rows show no exit instead of guessing one',
+      noExit.length === 2
+      && noExit.every(r => /切换前|无 key/.test(cellOf(r, 'API Key') || '')),
+      noExit.length + ' row(s): ' + noExit.map(r => cellOf(r, 'API Key')).join(' | '));
 // "a bucket row is never badged as disabled" used to live here as a
 // (切换前)-then-within-400-chars regex. [1b] now states it as a property of the
 // rows themselves, which is both stronger and not dependent on a magic width.
 
 console.log();
 console.log('[3] model pills');
-check('each model gets a pill', out.includes('glm-5.3') && out.includes('kimi-k2'));
-check('the overflow pill reports how many models it covers', out.includes('2 个模型'));
+check('the pills sit on the key that called those models',
+      cellIn(cnRow, '调用的模型分布').includes('glm-5.3')
+      && cellIn(cnRow, '调用的模型分布').includes('kimi-k2')
+      && !cellIn(crossRow, '调用的模型分布').includes('glm-5.3'),
+      show(cnRow, '调用的模型分布') + '  vs  ' + show(crossRow, '调用的模型分布'));
+check('the overflow pill reports how many models it covers, on that row',
+      cellIn(cnRow, '调用的模型分布').includes('2 个模型')
+      && !cellIn(crossRow, '调用的模型分布').includes('2 个模型'),
+      show(cnRow, '调用的模型分布'));
 check('a key with no calls says so rather than rendering nothing',
       api.keyModelPills(key({ models: [], models_other: null })).includes('无调用'));
 
